@@ -11,6 +11,16 @@ serde = { version = "1", features = ["derive"] }
 bincode = "1"
 blake3 = "1"
 
+# rand/rand_core pull in getrandom transitively for OS-entropy seeding paths
+# (StdRng::from_entropy(), thread_rng(), ...) that this crate never actually
+# calls -- every RNG here is seeded deterministically via seed_from_u64. But
+# getrandom still needs a backend picked for wasm32-unknown-unknown at
+# compile time, or the build fails outright. "js" makes it use the browser's
+# crypto API if that dead code path is ever hit; on native targets this
+# dependency/feature is simply unused.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
 [[example]]
 name = "demo"
 path = "examples/demo.rs"
