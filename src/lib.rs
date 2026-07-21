@@ -32,6 +32,8 @@ pub mod merkle;
 pub mod pq;
 pub mod projector;
 pub mod superpose;
+#[cfg(feature = "wasm")]
+pub mod wasm;
 
 pub use db::{EvictionPolicy, LatentDb, LatentDbError, SearchHit};
 pub use index::CentroidIndex;

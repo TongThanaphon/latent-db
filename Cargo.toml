@@ -5,11 +5,21 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+# rlib: normal native usage (examples, tests, downstream Rust crates).
+# cdylib: required by wasm-bindgen/wasm-pack to produce a loadable .wasm.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 blake3 = "1"
+wasm-bindgen = { version = "0.2", optional = true }
+serde_json = { version = "1", optional = true }
+
+[features]
+wasm = ["dep:wasm-bindgen", "dep:serde_json"]
 
 # rand/rand_core pull in getrandom transitively for OS-entropy seeding paths
 # (StdRng::from_entropy(), thread_rng(), ...) that this crate never actually
@@ -27,9 +37,12 @@ path = "examples/demo.rs"
 
 [dev-dependencies]
 anyhow = "1.0.104"
+axum = "0.8"
 candle-core = "0.11.0"
 candle-nn = "0.11.0"
 candle-transformers = "0.11.0"
 hf-hub = { version = "1.0.0", features = ["blocking"] }
 serde_json = "1.0.151"
 tokenizers = "0.23.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tower-http = { version = "0.6", features = ["cors"] }
