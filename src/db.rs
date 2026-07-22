@@ -13,6 +13,8 @@
 //! | MUX-Latent + EXPAND(i)    | `SuperposedSlot` -- many records, one vector   |
 //! | BLAKE3-committed vectors  | content hash used for de-duplication (FNV-1a) |
 //! | MerkleOctree / MerkleProof | `merkle` module -- per-record inclusion proofs |
+//! | Viable Manifold Graph     | `manifold::ViableGraph` -- kNN graph over a predicate-filtered record subset, `geodesic()` / `random_walk()` traversal (`build_viable_graph()`) |
+//! | Latent Field Steering     | `steering::SteeringVector` -- frozen direction + strength shifts the query before search (`search_steered()`) |
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -22,9 +24,11 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::index::CentroidIndex;
+use crate::manifold::{self, ViableGraph};
 use crate::merkle::{self, Digest, MerkleProof, MerkleTree};
 use crate::pq::PqCodec;
 use crate::projector::Projector;
+use crate::steering::SteeringVector;
 
 #[derive(Serialize, Deserialize)]
 struct StoredRecord {
@@ -255,6 +259,59 @@ impl LatentDb {
         scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
         scored.truncate(k);
         scored
+    }
+
+    /// Like [`Self::search`], but first shifts a copy of `query` by
+    /// `steering` (`state[i] += alpha * direction[i]`) before projecting and
+    /// searching -- concept conditioning / query expansion toward (or away
+    /// from, via the direction's sign) a frozen semantic axis, without
+    /// retraining anything. See the `steering` module for how to build and
+    /// persist a [`SteeringVector`].
+    ///
+    /// Returns an empty `Vec` if `query`'s or `steering`'s dimension doesn't
+    /// match `self.dim()`, matching [`Self::search`]'s own dim-mismatch
+    /// convention.
+    pub fn search_steered(
+        &self,
+        query: &[f32],
+        k: usize,
+        nprobe: usize,
+        steering: &SteeringVector,
+    ) -> Vec<SearchHit> {
+        if query.len() != self.dim || steering.dim() != self.dim {
+            return Vec::new();
+        }
+        let mut steered = query.to_vec();
+        steering.apply(&mut steered);
+        self.search(&steered, k, nprobe)
+    }
+
+    /// Build a [`ViableGraph`] over the subset of currently-stored records
+    /// for which `predicate` (applied to each record's approximate decoded
+    /// vector) is `true`, kNN-connected with `k_nearest` neighbors per node.
+    /// See the `manifold` module for `edge_midpoint_check` and how to
+    /// traverse the result (`geodesic`, `random_walk`).
+    ///
+    /// Ids are visited in ascending order before decoding so the resulting
+    /// graph's node assignment -- and therefore `random_walk`'s output for a
+    /// given seed -- is stable across rebuilds of the same record set, the
+    /// same determinism guarantee `merkle_leaves()` makes for
+    /// `merkle_root()`.
+    pub fn build_viable_graph<F>(
+        &self,
+        predicate: F,
+        k_nearest: usize,
+        edge_midpoint_check: bool,
+    ) -> ViableGraph
+    where
+        F: Fn(&[f32]) -> bool,
+    {
+        let mut ids: Vec<u64> = self.records.keys().copied().collect();
+        ids.sort_unstable();
+        let records = ids
+            .into_iter()
+            .map(|id| (id, self.pq.decode(&self.records[&id].codes)));
+        manifold::build_viable_graph(records, predicate, k_nearest, edge_midpoint_check)
     }
 
     /// Compression ratio achieved by PQ storage vs. keeping raw f32 vectors.
@@ -605,5 +662,95 @@ mod tests {
             db.get_metadata(outlier_id).is_some(),
             "the distinctive outlier should survive low-energy eviction"
         );
+    }
+
+    #[test]
+    fn search_steered_with_zero_alpha_matches_plain_search() {
+        let corpus = synthetic_corpus(100, 16, 40);
+        let mut db = LatentDb::build(&corpus, 2, 8, 4, 8, 41);
+        for v in &corpus {
+            db.insert(v, "x").unwrap();
+        }
+        let dir = SteeringVector::new(vec![1.0; 16], 0.0, 10.0).unwrap();
+        // norm of an all-ones length-16 vector is 4, well outside default
+        // tolerance -- use a generous norm_tol since this test only cares
+        // about alpha=0 being a true no-op, not the direction's shape.
+        let plain = db.search(&corpus[3], 5, db.n_index_centroids());
+        let steered = db.search_steered(&corpus[3], 5, db.n_index_centroids(), &dir);
+        assert_eq!(plain.len(), steered.len());
+        for (a, b) in plain.iter().zip(steered.iter()) {
+            assert_eq!(a.id, b.id);
+            assert_eq!(a.score, b.score);
+        }
+    }
+
+    #[test]
+    fn search_steered_rejects_dimension_mismatch() {
+        let corpus = synthetic_corpus(50, 16, 42);
+        let mut db = LatentDb::build(&corpus, 2, 8, 4, 8, 43);
+        for v in &corpus {
+            db.insert(v, "x").unwrap();
+        }
+        let wrong_dim_steering = SteeringVector::new(vec![1.0, 0.0], 0.5, 1e-4).unwrap();
+        assert!(db
+            .search_steered(&corpus[0], 5, db.n_index_centroids(), &wrong_dim_steering)
+            .is_empty());
+    }
+
+    #[test]
+    fn search_steered_toward_a_records_own_direction_raises_its_score() {
+        let corpus = synthetic_corpus(200, 32, 50);
+        let mut db = LatentDb::build(&corpus, 4, 16, 8, 8, 51);
+        let mut ids = Vec::new();
+        for (i, v) in corpus.iter().enumerate() {
+            ids.push(db.insert(v, format!("r{i}")).unwrap());
+        }
+
+        let target = db.get_approx_vector(ids[0]).unwrap();
+        let norm: f32 = target.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let direction: Vec<f32> = target.iter().map(|x| x / norm.max(1e-12)).collect();
+        let baseline = SteeringVector::new(direction.clone(), 0.0, 1e-3).unwrap();
+        let strong = SteeringVector::new(direction, 1.0, 1e-3).unwrap();
+
+        let query = &corpus[7];
+        let plain = db.search_steered(query, db.len(), db.n_index_centroids(), &baseline);
+        let steered = db.search_steered(query, db.len(), db.n_index_centroids(), &strong);
+
+        let plain_score = plain.iter().find(|h| h.id == ids[0]).unwrap().score;
+        let steered_score = steered.iter().find(|h| h.id == ids[0]).unwrap().score;
+        assert!(
+            steered_score > plain_score,
+            "steering the query toward record 0's own direction should raise its score \
+             ({steered_score} vs {plain_score})"
+        );
+    }
+
+    #[test]
+    fn build_viable_graph_restricts_to_the_predicate_and_walks_stay_inside_it() {
+        let corpus = synthetic_corpus(120, 8, 60);
+        let mut db = LatentDb::build(&corpus, 4, 16, 8, 8, 61);
+        let mut ids = Vec::new();
+        for (i, v) in corpus.iter().enumerate() {
+            ids.push(db.insert(v, format!("r{i}")).unwrap());
+        }
+
+        let graph = db.build_viable_graph(|v| v[0] > 0.0, 4, false);
+        let expected = ids
+            .iter()
+            .filter(|&&id| db.get_approx_vector(id).unwrap()[0] > 0.0)
+            .count();
+        assert_eq!(graph.n_nodes(), expected);
+
+        for &id in &ids {
+            let positive = db.get_approx_vector(id).unwrap()[0] > 0.0;
+            assert_eq!(graph.contains(id), positive);
+        }
+
+        let start = *ids.iter().find(|&&id| graph.contains(id)).unwrap();
+        let walk = graph.random_walk(start, 10, 7);
+        assert_eq!(walk.len(), 11);
+        for id in walk {
+            assert!(db.get_approx_vector(id).unwrap()[0] > 0.0);
+        }
     }
 }

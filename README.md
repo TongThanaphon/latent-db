@@ -23,6 +23,8 @@ Schema Centroid indexing).
 | `index.rs`       | Schema Centroid                       | IVF-style centroid index: bucket records by nearest centroid, probe only the closest `nprobe` buckets at query time |
 | `superpose.rs`   | MUX-Latent naming, algorithm diverges — see note below | Holographic Reduced Representations: `bind` (circular convolution) + `bundle` (sum) + `unbind` (circular correlation) to pack many (key, value) pairs into one fixed-size vector, genuinely lossy by construction |
 | `merkle.rs`      | `MerkleOctree` / `MerkleProof`        | General binary BLAKE3 Merkle tree (katgpt-rs's is a fixed 64-leaf octree; this crate's record count varies at runtime) — `LatentDb::merkle_root()` + `merkle_proof(id)` give per-record inclusion proofs over the whole DB |
+| `manifold.rs`    | Viable Manifold Graph (game-AI latent navigation, arXiv:2206.00106 distillation) | A kNN graph over the subset of stored records passing a caller predicate; `geodesic()` (A*) and `random_walk()` traverse it without ever visiting a record that fails the predicate — see note below on the dropped pullback-volume gate |
+| `steering.rs`    | Latent Field Steering (game-AI direction-vector injection) | A BLAKE3-committed, unit-norm direction + strength shifts a *query* vector before search (`LatentDb::search_steered()`) — concept conditioning without retraining; see note below on why it steers queries, not stored records |
 | `db.rs`          | The overall pipeline, plus `LatentContextBuffer`-style budget/eviction | Ties the above together: insert embeddings, dedupe by content hash, PQ-compress, centroid-index, approximate search, save/load to disk, optional `record_budget` + `EvictionPolicy` (see note below) |
 
 ## Usage
@@ -63,6 +65,23 @@ assert!(proof.verify(&root));
 use latent_db::EvictionPolicy;
 db.set_eviction_policy(EvictionPolicy::LowestEnergy);
 db.set_record_budget(10_000); // 0 (the default) = unlimited
+
+// 7. Steer a query toward a frozen concept direction before searching.
+use latent_db::SteeringVector;
+let direction: Vec<f32> = /* unit-norm vector, same dim as the DB */ vec![];
+let steering = SteeringVector::new(direction, /* alpha */ 0.6, /* norm_tol */ 1e-3)?;
+let hits = db.search_steered(&query_embedding, 5, 4, &steering);
+
+// 8. Explore a predicate-filtered subset of records as a navigation graph.
+let graph = db.build_viable_graph(
+    |v: &[f32]| v[0] > 0.0,  // keep only records passing this check
+    /* k_nearest */ 4,
+    /* edge_midpoint_check */ false,
+);
+if let Some(path) = graph.geodesic(id_a, id_b) {
+    println!("{} hops from a to b, all passing the predicate", path.len() - 1);
+}
+let walk = graph.random_walk(id_a, /* steps */ 20, /* seed */ 42);
 ```
 
 For the more extreme "many records in one vector" mode:
@@ -101,7 +120,7 @@ name being borrowed from it.
 ## Run the demo
 
 ```bash
-cargo test                       # 10 unit tests
+cargo test                       # 53 unit tests
 cargo run --release --example demo
 ```
 
@@ -150,6 +169,27 @@ accuracy degrading as more pairs are packed in.
   a record's "energy" is its squared distance (in the projected sketch
   space) to its assigned centroid, so records that look like everything
   else in their bucket get evicted before distinctive outliers do.
+- **`manifold.rs`'s `ViableGraph` drops katgpt-rs's pullback-volume gate.**
+  The real Viable Manifold Graph also filters candidate nodes on
+  `log det(J_f^T J_f)` — the pullback volume of a caller-supplied smooth map
+  `f`, meaningful when `f` is a nonlinear decoder. `LatentDb`'s own
+  dimensionality map (`Projector::project`) is a fixed linear matrix, so its
+  Jacobian is constant everywhere and that volume field couldn't
+  discriminate anything here even in principle — dropped rather than ported.
+  The predicate alone gates node admission, and, like the batch-trained PQ
+  codebooks and the from-scratch `merkle_tree()`, `build_viable_graph()` is
+  meant to be rebuilt (O(n^2) kNN) whenever the record set changes, not
+  maintained incrementally.
+- **`steering.rs`'s `SteeringVector` steers queries, not stored records.**
+  katgpt-rs's Latent Field Steering mutates a live NPC's per-tick latent
+  state in place, plus a localized-field layer (`FieldSupport::{Global,
+  Radius,Zone}`) for steering many game entities by world position.
+  `LatentDb` records have no position, and they're stored as PQ codes, not
+  raw floats — steering a stored record would mean decode → add → re-encode,
+  which is lossy and would silently invalidate that record's content hash,
+  dedup entry, and Merkle leaf. `search_steered()` instead shifts the
+  *query* before projection/search, leaving storage untouched; steering
+  stored records directly is out of scope for now.
 - The content hash used for de-duplication is a simple FNV-1a rather than
   BLAKE3. This was originally a toolchain workaround (an older Rust
   toolchain here couldn't build BLAKE3's `cpufeatures` dependency); on a

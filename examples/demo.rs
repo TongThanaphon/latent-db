@@ -3,17 +3,22 @@
 //! Run with:
 //!     cargo run --release --example demo
 //!
-//! Shows two things end to end:
+//! Shows several things end to end:
 //!   1. LatentDb: build from a training corpus, insert embeddings +
 //!      metadata, run approximate nearest-neighbour search, check the
 //!      compression ratio, and round-trip through save/load.
 //!   2. SuperposedSlot: the more extreme MUX-Latent-style mode where many
 //!      (key, value) pairs share a single vector, with retrieval quality
 //!      shown degrading as more pairs are packed in.
+//!   3. Latent Field Steering: biasing a query toward a topic axis before
+//!      searching, without retraining anything.
+//!   4. Viable Manifold Graph: navigating a predicate-filtered subset of
+//!      records (geodesic + random walk) that never leaves the subset.
 
-use latent_db::{cosine_sim, EvictionPolicy, LatentDb, SuperposedSlot};
+use latent_db::{cosine_sim, EvictionPolicy, LatentDb, SearchHit, SteeringVector, SuperposedSlot};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use std::collections::HashMap;
 
 const DIM: usize = 32;
 
@@ -48,6 +53,32 @@ fn make_corpus(
 
 fn section(title: &str) {
     println!("\n=== {title} ===");
+}
+
+fn euclidean(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y) * (x - y))
+        .sum::<f32>()
+        .sqrt()
+}
+
+/// Mean vector of every `corpus[i]` whose `topics[i] == topic`.
+fn topic_centroid(corpus: &[Vec<f32>], topics: &[usize], topic: usize, dim: usize) -> Vec<f32> {
+    let mut sum = vec![0.0f32; dim];
+    let mut count = 0usize;
+    for (v, &t) in corpus.iter().zip(topics) {
+        if t == topic {
+            for i in 0..dim {
+                sum[i] += v[i];
+            }
+            count += 1;
+        }
+    }
+    for x in &mut sum {
+        *x /= count.max(1) as f32;
+    }
+    sum
 }
 
 fn main() {
@@ -165,7 +196,93 @@ fn main() {
         tampered.verify(&root)
     );
 
-    section("8. Bounded-memory operation: record budget + eviction");
+    // id -> topic lookup, reused by sections 8 and 9. Computed (and those
+    // sections run) *before* the eviction demo in section 10 -- eviction
+    // removes records, and we want the steering/graph demos to see the
+    // full, un-thinned corpus.
+    let id_to_topic: HashMap<u64, usize> = ids.iter().copied().zip(topics.iter().copied()).collect();
+    let topic_centers: Vec<Vec<f32>> =
+        (0..n_topics).map(|t| topic_centroid(&corpus, &topics, t, DIM)).collect();
+
+    section("8. Latent Field Steering: bias a query toward a topic axis");
+    let (topic_a, topic_b) = (0usize, 1usize);
+    let neutral_query: Vec<f32> = topic_centers[topic_a]
+        .iter()
+        .zip(topic_centers[topic_b].iter())
+        .map(|(a, b)| (a + b) / 2.0)
+        .collect();
+    let diff: Vec<f32> = topic_centers[topic_b]
+        .iter()
+        .zip(topic_centers[topic_a].iter())
+        .map(|(b, a)| b - a)
+        .collect();
+    let diff_norm = diff.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let direction: Vec<f32> = diff.iter().map(|x| x / diff_norm).collect();
+    let steering = SteeringVector::new(direction, 0.8, 1e-3).expect("unit-norm direction");
+
+    let count_topic = |hits: &[SearchHit], topic: usize| -> usize {
+        hits.iter()
+            .filter(|h| id_to_topic.get(&h.id) == Some(&topic))
+            .count()
+    };
+    let top_k = 10;
+    let nprobe = db.n_index_centroids();
+    let plain_hits = db.search(&neutral_query, top_k, nprobe);
+    let steered_hits = db.search_steered(&neutral_query, top_k, nprobe, &steering);
+
+    println!(
+        "neutral query = midpoint of topic {topic_a} & topic {topic_b} centroids, top-{top_k} by topic:"
+    );
+    println!(
+        "  plain search:   topic {topic_a}={:<3} topic {topic_b}={:<3} other={}",
+        count_topic(&plain_hits, topic_a),
+        count_topic(&plain_hits, topic_b),
+        top_k - count_topic(&plain_hits, topic_a) - count_topic(&plain_hits, topic_b)
+    );
+    println!(
+        "  steered search (alpha=0.8 toward topic {topic_b}): topic {topic_a}={:<3} topic {topic_b}={:<3} other={}",
+        count_topic(&steered_hits, topic_a),
+        count_topic(&steered_hits, topic_b),
+        top_k - count_topic(&steered_hits, topic_a) - count_topic(&steered_hits, topic_b)
+    );
+
+    section("9. Viable Manifold Graph: navigate a predicate-filtered subset");
+    let predicate = |v: &[f32]| {
+        let d0 = euclidean(v, &topic_centers[0]);
+        (0..n_topics).all(|t| t == 0 || euclidean(v, &topic_centers[t]) >= d0)
+    };
+    let graph = db.build_viable_graph(predicate, /* k_nearest */ 4, /* edge_midpoint_check */ false);
+    println!(
+        "predicate: 'nearest topic centroid is topic 0' -> kept {} of {} records as graph nodes, {} edges",
+        graph.n_nodes(),
+        db.len(),
+        graph.n_edges()
+    );
+
+    let topic0_ids: Vec<u64> = ids
+        .iter()
+        .copied()
+        .filter(|id| id_to_topic.get(id) == Some(&0))
+        .collect();
+    if topic0_ids.len() >= 2 {
+        let (a, b) = (topic0_ids[0], topic0_ids[1]);
+        match graph.geodesic(a, b) {
+            Some(path) => println!(
+                "geodesic({a}, {b}): {} hops, staying within the topic-0 neighborhood",
+                path.len() - 1
+            ),
+            None => println!("geodesic({a}, {b}): unreachable (topic-0 subset split into separate components)"),
+        }
+
+        let walk = graph.random_walk(a, 10, 42);
+        let all_topic0 = walk.iter().all(|id| id_to_topic.get(id) == Some(&0));
+        println!(
+            "random_walk({a}, steps=10, seed=42): visited {} ids, all still topic 0: {all_topic0}",
+            walk.len()
+        );
+    }
+
+    section("10. Bounded-memory operation: record budget + eviction");
     println!("before capping: {} records stored", db.len());
     db.set_eviction_policy(EvictionPolicy::LowestEnergy);
     db.set_record_budget(200);
