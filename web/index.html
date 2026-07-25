@@ -4,25 +4,83 @@
 <meta charset="utf-8" />
 <title>latent-db mini semantic search (wasm)</title>
 <style>
-  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 3rem auto; padding: 0 1rem; }
+  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 3rem auto; padding: 0 1rem; }
   h1 { font-size: 1.25rem; }
+  h2 { font-size: 1.05rem; margin-top: 2.5rem; border-top: 1px solid #ddd; padding-top: 1.5rem; }
   #status { color: #666; font-size: 0.9rem; margin-bottom: 1rem; }
-  form { display: flex; gap: 0.5rem; }
-  input[type=text] { flex: 1; padding: 0.5rem; font-size: 1rem; }
+  form { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+  input[type=text] { flex: 1; min-width: 10rem; padding: 0.5rem; font-size: 1rem; }
   button { padding: 0.5rem 1rem; font-size: 1rem; }
   ul { list-style: none; padding: 0; }
   li { padding: 0.6rem; border: 1px solid #ddd; border-radius: 6px; margin: 0.4rem 0; }
   .score { color: #888; font-size: 0.85rem; }
+  .panel { opacity: 0.5; pointer-events: none; }
+  .panel.enabled { opacity: 1; pointer-events: auto; }
+  .hint { color: #888; font-size: 0.85rem; margin: 0.3rem 0 1rem; }
+  .row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; margin: 0.5rem 0; }
+  .row label { font-size: 0.9rem; color: #444; }
+  .cols { display: flex; gap: 1.5rem; flex-wrap: wrap; }
+  .col { flex: 1; min-width: 14rem; }
+  .col h3 { font-size: 0.9rem; margin: 0 0 0.3rem; color: #444; }
+  output { font-variant-numeric: tabular-nums; min-width: 2.5rem; display: inline-block; }
+  .num { width: 4.5rem; padding: 0.3rem; }
 </style>
 </head>
 <body>
 <h1>latent-db mini semantic search</h1>
 <p id="status">Loading wasm module + corpus.bin...</p>
 <form id="query-form">
-  <input id="query-input" type="text" placeholder="Ask about cooking, astronomy, or finance..." disabled />
+  <input id="query-input" type="text" placeholder="Ask about cooking, astronomy, finance, travel, health, or technology..." disabled />
   <button type="submit" disabled>Search</button>
 </form>
 <ul id="results"></ul>
+
+<h2>Latent Field Steering</h2>
+<p class="hint">Run a search above first. This biases that same query away from one idea and toward another before searching again -- no retraining, just an additive shift on the query vector.</p>
+<div id="steering-panel" class="panel">
+  <div class="row">
+    <input id="steer-away" type="text" placeholder="away from (e.g. finance)" />
+    <input id="steer-toward" type="text" placeholder="toward (e.g. travel)" />
+  </div>
+  <div class="row">
+    <label for="steer-alpha">strength (alpha)</label>
+    <input id="steer-alpha" type="range" min="0" max="1" step="0.05" value="1" />
+    <output id="steer-alpha-value">1.00</output>
+    <button id="steer-apply" type="button">Apply steering</button>
+  </div>
+  <p class="hint">alpha is capped at 1.0 by design (a full unit step); if your query already
+    strongly matches one topic, steering shifts scores toward "toward" even before it flips
+    the very top result -- watch the lower-ranked entries, not just #1.</p>
+  <p id="steer-status" class="hint"></p>
+  <div class="cols">
+    <div class="col"><h3>plain search</h3><ul id="steer-plain"></ul></div>
+    <div class="col"><h3>steered search</h3><ul id="steer-steered"></ul></div>
+  </div>
+</div>
+
+<h2>Explore neighborhood (Viable Manifold Graph)</h2>
+<p class="hint">Builds a kNN graph over records within a radius of that same query, then walks it (random walk + geodesic) without ever stepping outside that neighborhood.</p>
+<div id="explore-panel" class="panel">
+  <div class="row">
+    <label for="explore-size">neighborhood size</label>
+    <input id="explore-size" class="num" type="number" min="2" max="40" value="10" />
+    <span class="hint" style="margin:0">(the N closest records to the query become graph nodes; the radius that implies is shown after exploring)</span>
+  </div>
+  <div class="row">
+    <label for="explore-k">k_nearest</label>
+    <input id="explore-k" class="num" type="number" min="1" max="10" value="3" />
+    <label for="explore-steps">steps</label>
+    <input id="explore-steps" class="num" type="number" min="1" max="30" value="8" />
+    <label for="explore-seed">seed</label>
+    <input id="explore-seed" class="num" type="number" min="0" value="42" />
+    <button id="explore-run" type="button">Explore</button>
+  </div>
+  <p id="explore-stats" class="hint"></p>
+  <div class="cols">
+    <div class="col"><h3>random walk</h3><ul id="explore-walk"></ul></div>
+    <div class="col"><h3>geodesic</h3><ul id="explore-geodesic"></ul></div>
+  </div>
+</div>
 
 <script type="module">
 import init, { WasmLatentDb } from "./pkg/latent_db.js";
@@ -35,7 +93,32 @@ const input = document.getElementById("query-input");
 const button = form.querySelector("button");
 const resultsEl = document.getElementById("results");
 
+const steeringPanel = document.getElementById("steering-panel");
+const steerAway = document.getElementById("steer-away");
+const steerToward = document.getElementById("steer-toward");
+const steerAlpha = document.getElementById("steer-alpha");
+const steerAlphaValue = document.getElementById("steer-alpha-value");
+const steerApply = document.getElementById("steer-apply");
+const steerPlainEl = document.getElementById("steer-plain");
+const steerSteeredEl = document.getElementById("steer-steered");
+const steerStatusEl = document.getElementById("steer-status");
+
+const explorePanel = document.getElementById("explore-panel");
+const exploreSize = document.getElementById("explore-size");
+const exploreK = document.getElementById("explore-k");
+const exploreSteps = document.getElementById("explore-steps");
+const exploreSeed = document.getElementById("explore-seed");
+const exploreRun = document.getElementById("explore-run");
+const exploreStatsEl = document.getElementById("explore-stats");
+const exploreWalkEl = document.getElementById("explore-walk");
+const exploreGeodesicEl = document.getElementById("explore-geodesic");
+
 let db;
+let lastQueryEmbedding = null;
+
+steerAlpha.addEventListener("input", () => {
+  steerAlphaValue.textContent = Number(steerAlpha.value).toFixed(2);
+});
 
 async function embedQuery(text) {
   const resp = await fetch(EMBED_SERVER, {
@@ -46,6 +129,26 @@ async function embedQuery(text) {
   if (!resp.ok) throw new Error(`embed_server returned ${resp.status}`);
   const { embedding } = await resp.json();
   return embedding;
+}
+
+// Renders search hits ({id, score, metadata}).
+function renderHits(el, hits) {
+  el.innerHTML = "";
+  if (!hits || hits.length === 0) {
+    el.innerHTML = "<li>No results.</li>";
+    return;
+  }
+  for (const hit of hits) {
+    const li = document.createElement("li");
+    li.innerHTML = `<div class="score">score=${hit.score.toFixed(4)}</div>${hit.metadata}`;
+    el.appendChild(li);
+  }
+}
+
+// Renders plain (id, metadata) docs -- graph walk/geodesic entries have no score.
+function renderDocList(el, docs, prefixHtml) {
+  const items = (docs || []).map((d) => `<li>${d.metadata ?? "(missing)"}</li>`).join("");
+  el.innerHTML = (prefixHtml ?? "") + (items || "<li>No records.</li>");
 }
 
 async function main() {
@@ -67,24 +170,88 @@ form.addEventListener("submit", async (e) => {
 
   button.disabled = true;
   resultsEl.innerHTML = "<li>Searching...</li>";
+  steeringPanel.classList.remove("enabled");
+  explorePanel.classList.remove("enabled");
   try {
     const embedding = await embedQuery(query);
-    const hitsJson = db.search(Float32Array.from(embedding), 3, db.len());
-    const hits = JSON.parse(hitsJson);
+    lastQueryEmbedding = Float32Array.from(embedding);
+    const hitsJson = db.search(lastQueryEmbedding, 3, db.len());
+    renderHits(resultsEl, JSON.parse(hitsJson));
 
-    resultsEl.innerHTML = "";
-    if (hits.length === 0) {
-      resultsEl.innerHTML = "<li>No results.</li>";
-    }
-    for (const hit of hits) {
-      const li = document.createElement("li");
-      li.innerHTML = `<div class="score">score=${hit.score.toFixed(4)}</div>${hit.metadata}`;
-      resultsEl.appendChild(li);
-    }
+    steerStatusEl.textContent = "";
+    exploreStatsEl.textContent = "";
+    steerPlainEl.innerHTML = "";
+    steerSteeredEl.innerHTML = "";
+    exploreWalkEl.innerHTML = "";
+    exploreGeodesicEl.innerHTML = "";
+    steeringPanel.classList.add("enabled");
+    explorePanel.classList.add("enabled");
   } catch (err) {
     resultsEl.innerHTML = `<li>Error: ${err.message} -- is embed_server running on :8787?</li>`;
   } finally {
     button.disabled = false;
+  }
+});
+
+steerApply.addEventListener("click", async () => {
+  if (!db || !lastQueryEmbedding) return;
+  const away = steerAway.value.trim();
+  const toward = steerToward.value.trim();
+  if (!away || !toward) {
+    steerStatusEl.textContent = 'Enter both an "away from" and a "toward" phrase.';
+    return;
+  }
+  steerApply.disabled = true;
+  steerStatusEl.textContent = "Embedding away/toward phrases...";
+  try {
+    const [awayVec, towardVec] = await Promise.all([embedQuery(away), embedQuery(toward)]);
+    const dim = awayVec.length;
+    const diff = new Float32Array(dim);
+    for (let i = 0; i < dim; i++) diff[i] = towardVec[i] - awayVec[i];
+    const norm = Math.sqrt(diff.reduce((s, x) => s + x * x, 0));
+    if (norm < 1e-6) {
+      steerStatusEl.textContent = '"away" and "toward" embed too similarly -- try more distinct phrases.';
+      return;
+    }
+    const direction = diff.map((x) => x / norm);
+    const alpha = Number(steerAlpha.value);
+
+    // Top-6 (not just top-3): with a query that already strongly matches
+    // one topic, alpha<=1 often isn't enough to unseat the #1 result, but
+    // the shift is still visible further down the ranking.
+    const topN = 6;
+    const nprobe = db.len();
+    const plainJson = db.search(lastQueryEmbedding, topN, nprobe);
+    const steeredJson = db.searchSteered(lastQueryEmbedding, topN, nprobe, direction, alpha, 1e-3);
+    renderHits(steerPlainEl, JSON.parse(plainJson));
+    renderHits(steerSteeredEl, JSON.parse(steeredJson));
+    steerStatusEl.textContent = `steered alpha=${alpha.toFixed(2)} toward "${toward}", away from "${away}"`;
+  } catch (err) {
+    steerStatusEl.textContent = `Error: ${err.message}`;
+  } finally {
+    steerApply.disabled = false;
+  }
+});
+
+exploreRun.addEventListener("click", () => {
+  if (!db || !lastQueryEmbedding) return;
+  const neighborhoodSize = Number(exploreSize.value);
+  const kNearest = Number(exploreK.value);
+  const steps = Number(exploreSteps.value);
+  const seed = BigInt(Math.trunc(Number(exploreSeed.value)) || 0);
+  try {
+    const json = db.exploreNeighborhood(lastQueryEmbedding, neighborhoodSize, kNearest, steps, seed);
+    const result = JSON.parse(json);
+    exploreStatsEl.textContent =
+      `${result.nNodes} nodes, ${result.nEdges} edges (effective radius ${result.radius.toFixed(4)})`;
+    renderDocList(exploreWalkEl, result.randomWalk);
+    if (result.geodesic) {
+      renderDocList(exploreGeodesicEl, result.geodesic.path, `<li><em>${result.geodesic.hops} hop(s)</em></li>`);
+    } else {
+      exploreGeodesicEl.innerHTML = "<li>Not enough in-neighborhood records to compute a geodesic.</li>";
+    }
+  } catch (err) {
+    exploreStatsEl.textContent = `Error: ${err.message}`;
   }
 });
 

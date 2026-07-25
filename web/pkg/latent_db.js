@@ -25,6 +25,52 @@ export class WasmLatentDb {
         return ret >>> 0;
     }
     /**
+     * Explore a Viable Manifold Graph over the `neighborhood_size` records
+     * closest (Euclidean, over the approximate decoded vector) to `anchor`
+     * -- typically the same embedding just passed to `search`. Reports
+     * graph size, a random walk of `steps` hops (seeded by `seed`) starting
+     * near `anchor`, and -- when a second in-graph record is found -- a
+     * geodesic between the two nearest in-graph records to `anchor`.
+     *
+     * The Euclidean radius that gates graph membership is derived from
+     * `neighborhood_size` (the distance to the `neighborhood_size`-th
+     * closest record) rather than taken as a raw parameter: a fixed radius
+     * would have to be picked in the caller's embedding-distance units,
+     * which vary by model and aren't knowable in advance, whereas "include
+     * my N nearest records" is scale-invariant and can never silently
+     * produce an empty graph the way a mis-scaled fixed radius can.
+     *
+     * Returns a JSON object:
+     * `{ nNodes, nEdges, radius, randomWalk: [{id,metadata}, ...],
+     *    geodesic: { from, to, hops, path: [{id,metadata}, ...] } | null }`.
+     * @param {Float32Array} anchor
+     * @param {number} neighborhood_size
+     * @param {number} k_nearest
+     * @param {number} steps
+     * @param {bigint} seed
+     * @returns {string}
+     */
+    exploreNeighborhood(anchor, neighborhood_size, k_nearest, steps, seed) {
+        let deferred3_0;
+        let deferred3_1;
+        try {
+            const ptr0 = passArrayF32ToWasm0(anchor, wasm.__wbindgen_malloc);
+            const len0 = WASM_VECTOR_LEN;
+            const ret = wasm.wasmlatentdb_exploreNeighborhood(this.__wbg_ptr, ptr0, len0, neighborhood_size, k_nearest, steps, seed);
+            var ptr2 = ret[0];
+            var len2 = ret[1];
+            if (ret[3]) {
+                ptr2 = 0; len2 = 0;
+                throw takeFromExternrefTable0(ret[2]);
+            }
+            deferred3_0 = ptr2;
+            deferred3_1 = len2;
+            return getStringFromWasm0(ptr2, len2);
+        } finally {
+            wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
+        }
+    }
+    /**
      * Deserialize a `LatentDb` previously produced by `bincode::serialize`
      * (see `examples/build_index.rs`), e.g. from a `fetch()`'d byte buffer.
      * @param {Uint8Array} bytes
@@ -80,6 +126,42 @@ export class WasmLatentDb {
             return getStringFromWasm0(ptr2, len2);
         } finally {
             wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
+        }
+    }
+    /**
+     * Like [`Self::search`], but first shifts `query` by a steering
+     * direction before searching -- see `steering::SteeringVector`.
+     * `direction` must be unit-norm (within `norm_tol`) and the same
+     * dimension as the DB; `alpha` (steering strength) must be in `[0, 1]`.
+     * Returns the same JSON shape as [`Self::search`].
+     * @param {Float32Array} query
+     * @param {number} k
+     * @param {number} nprobe
+     * @param {Float32Array} direction
+     * @param {number} alpha
+     * @param {number} norm_tol
+     * @returns {string}
+     */
+    searchSteered(query, k, nprobe, direction, alpha, norm_tol) {
+        let deferred4_0;
+        let deferred4_1;
+        try {
+            const ptr0 = passArrayF32ToWasm0(query, wasm.__wbindgen_malloc);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passArrayF32ToWasm0(direction, wasm.__wbindgen_malloc);
+            const len1 = WASM_VECTOR_LEN;
+            const ret = wasm.wasmlatentdb_searchSteered(this.__wbg_ptr, ptr0, len0, k, nprobe, ptr1, len1, alpha, norm_tol);
+            var ptr3 = ret[0];
+            var len3 = ret[1];
+            if (ret[3]) {
+                ptr3 = 0; len3 = 0;
+                throw takeFromExternrefTable0(ret[2]);
+            }
+            deferred4_0 = ptr3;
+            deferred4_1 = len3;
+            return getStringFromWasm0(ptr3, len3);
+        } finally {
+            wasm.__wbindgen_free(deferred4_0, deferred4_1, 1);
         }
     }
 }

@@ -23,30 +23,68 @@ use hf_hub::HFClientSync;
 use latent_db::LatentDb;
 use tokenizers::{PaddingParams, Tokenizer};
 
-/// A small corpus spanning 3 distinct topics, so correct vs. random
-/// retrieval is easy to tell apart at a glance.
+/// A small corpus spanning 6 distinct topics, so correct vs. random
+/// retrieval is easy to tell apart at a glance, and so the `manifold` /
+/// `steering` demos in the wasm browser UI (`web/index.html`) have enough
+/// same-topic neighbors per document for a non-trivial kNN graph.
 const CORPUS: &[(&str, &str)] = &[
     ("cooking", "Preheat the oven to 200C before baking the bread."),
     ("cooking", "Add a pinch of salt to the pasta water while it boils."),
     ("cooking", "Simmer the tomato sauce for twenty minutes until it thickens."),
     ("cooking", "Whisk the eggs and sugar together until the mixture is pale."),
     ("cooking", "Marinate the chicken in soy sauce and garlic overnight."),
+    ("cooking", "Knead the dough for ten minutes until it becomes smooth and elastic."),
+    ("cooking", "Season the steak generously with salt and pepper before searing it."),
+    ("cooking", "Fold the whipped cream gently into the chocolate mousse."),
     ("astronomy", "Jupiter is the largest planet in the solar system."),
     ("astronomy", "A neutron star can form when a massive star collapses."),
     ("astronomy", "The Hubble telescope has captured images of distant galaxies."),
     ("astronomy", "Saturn's rings are made mostly of ice and rock particles."),
     ("astronomy", "Astronomers detected a new exoplanet orbiting a red dwarf."),
+    ("astronomy", "A total solar eclipse occurs when the moon fully blocks the sun."),
+    ("astronomy", "Black holes warp spacetime so strongly that light cannot escape."),
+    ("astronomy", "The Milky Way contains hundreds of billions of stars."),
     ("finance", "The central bank raised interest rates to curb inflation."),
     ("finance", "Diversifying a portfolio reduces exposure to a single asset."),
     ("finance", "The company reported quarterly earnings above analyst expectations."),
     ("finance", "Bond yields fell after the latest jobs report was released."),
     ("finance", "Investors moved capital into index funds during the downturn."),
+    ("finance", "A rising unemployment rate often signals a slowing economy."),
+    ("finance", "The stock market rallied after the merger was announced."),
+    ("finance", "Compound interest lets savings grow faster over long time horizons."),
+    ("travel", "Book a window seat for the best view during the flight."),
+    ("travel", "The train departs from platform nine at half past six."),
+    ("travel", "Pack light when hiking through the mountains for several days."),
+    ("travel", "The old town's cobblestone streets are best explored on foot."),
+    ("travel", "Renew your passport well before an international trip."),
+    ("travel", "The ferry crosses the strait twice a day during summer."),
+    ("travel", "Local guides recommend visiting the market early in the morning."),
+    ("travel", "A long layover gives travelers time to explore the airport city."),
+    ("health", "Drinking enough water throughout the day supports healthy digestion."),
+    ("health", "Regular exercise lowers the risk of heart disease over time."),
+    ("health", "A balanced diet includes plenty of vegetables and whole grains."),
+    ("health", "Getting seven to eight hours of sleep improves concentration."),
+    ("health", "Stretching before a workout helps prevent muscle strain."),
+    ("health", "Doctors recommend an annual checkup to catch problems early."),
+    ("health", "Chronic stress can weaken the immune system over months."),
+    ("health", "Washing hands frequently reduces the spread of common colds."),
+    ("technology", "The new processor doubles battery life compared to last year's model."),
+    ("technology", "Cloud storage lets users access files from any device."),
+    ("technology", "Encryption protects sensitive data from unauthorized access."),
+    ("technology", "The software update fixed several long-standing security bugs."),
+    ("technology", "Machine learning models improve as they train on more data."),
+    ("technology", "Fiber-optic cables carry data faster than traditional copper wires."),
+    ("technology", "A firmware bug caused the smart thermostat to overheat."),
+    ("technology", "Open-source projects rely on contributions from volunteer developers."),
 ];
 
 const QUERIES: &[(&str, &str)] = &[
     ("cooking", "What temperature should I set the oven to for baking?"),
     ("astronomy", "Tell me about planets and stars in space."),
     ("finance", "How do interest rates affect the stock market?"),
+    ("travel", "What should I pack for a hiking trip?"),
+    ("health", "How much sleep do I need to stay focused?"),
+    ("technology", "How does encryption keep my data safe?"),
 ];
 
 struct Embedder {
@@ -136,9 +174,9 @@ fn main() -> Result<()> {
     let dim = corpus_embeddings[0].len();
     println!("embedding dimension: {dim}");
 
-    // n_subspaces must divide dim (384 for MiniLM); n_pq_centroids /
-    // n_index_centroids kept small since this corpus only has 15 documents.
-    let mut db = LatentDb::build(&corpus_embeddings, 8, 8, 3, 8, 42);
+    // n_subspaces must divide dim (384 for MiniLM); n_index_centroids
+    // matches the corpus's 6 topics.
+    let mut db = LatentDb::build(&corpus_embeddings, 8, 16, 6, 8, 42);
     for ((topic, text), embedding) in CORPUS.iter().zip(corpus_embeddings.iter()) {
         db.insert(embedding, format!("[{topic}] {text}"))?;
     }
