@@ -130,6 +130,16 @@ the exact record queried with as the top hit), reports the PQ compression
 ratio, round-trips through save/load, and shows the superposition slot's
 accuracy degrading as more pairs are packed in.
 
+## Development
+
+This repo ships a pre-commit hook (`.githooks/pre-commit`) that runs
+`cargo fmt --check`, `cargo clippy`, and `cargo test` on staged Rust changes.
+Enable it once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
 ## Design notes & honest limitations
 
 - **This is a research/embedded-use prototype, not a production vector DB.**
