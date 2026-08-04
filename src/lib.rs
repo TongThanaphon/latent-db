@@ -46,6 +46,7 @@ pub mod manifold;
 pub mod merkle;
 pub mod pq;
 pub mod projector;
+pub mod simd;
 pub mod steering;
 pub mod superpose;
 #[cfg(feature = "wasm")]
@@ -55,7 +56,7 @@ pub use db::{EvictionPolicy, LatentDb, LatentDbError, SearchHit};
 pub use index::CentroidIndex;
 pub use manifold::{build_viable_graph, ViableGraph};
 pub use merkle::{Digest, MerkleProof, MerkleTree};
-pub use pq::PqCodec;
+pub use pq::{PqCodec, QueryLut};
 pub use projector::Projector;
 pub use steering::{SteeringEnvelope, SteeringError, SteeringVector};
 pub use superpose::{circular_convolve, circular_correlate, cosine_sim, SuperposedSlot};

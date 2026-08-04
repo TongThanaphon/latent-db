@@ -235,6 +235,13 @@ impl LatentDb {
 
     /// Approximate nearest-neighbour search. `nprobe` controls how many
     /// centroid buckets get scanned (higher = more accurate, slower).
+    ///
+    /// Candidates are scored via a per-query asymmetric-distance lookup
+    /// table (`PqCodec::build_query_lut`): the query's dot product and norm
+    /// against every centroid in every subspace is computed once, then each
+    /// candidate's stored codes are summed against that table
+    /// (`QueryLut::cosine_score`) -- no per-candidate PQ decode, no
+    /// per-candidate allocation.
     pub fn search(&self, query: &[f32], k: usize, nprobe: usize) -> Vec<SearchHit> {
         if query.len() != self.dim {
             return Vec::new();
@@ -242,12 +249,12 @@ impl LatentDb {
         let projected_query = self.projector.project(query);
         let candidates = self.index.candidates(&projected_query, nprobe);
 
+        let lut = self.pq.build_query_lut(query);
         let mut scored: Vec<SearchHit> = candidates
             .into_iter()
             .filter_map(|id| {
                 let rec = self.records.get(&id)?;
-                let approx = self.pq.decode(&rec.codes);
-                let score = crate::superpose::cosine_sim(query, &approx);
+                let score = lut.cosine_score(&rec.codes);
                 Some(SearchHit {
                     id,
                     score,
@@ -497,6 +504,52 @@ mod tests {
         let hits = db.search(probe_target, 5, db.n_index_centroids());
         assert!(!hits.is_empty());
         assert_eq!(hits[0].id, ids[10]);
+    }
+
+    /// Issue 2 acceptance criterion: `search`'s LUT-scored top-k must match
+    /// the pre-change (decode + `cosine_sim`) baseline's ids, order, and
+    /// scores (within float tolerance) on a fixed synthetic corpus.
+    /// `nprobe = n_index_centroids()` makes `search`'s candidate set
+    /// exhaustive -- every stored id -- so the "baseline" computed here by
+    /// decoding every record and scoring it directly is exactly what
+    /// `search` itself scores, just via the old decode path instead of the
+    /// new LUT path.
+    #[test]
+    fn search_lut_scoring_matches_decode_baseline_topk_and_order() {
+        let corpus = synthetic_corpus(500, 32, 70);
+        let mut db = LatentDb::build(&corpus, 4, 16, 8, 8, 71);
+        let mut ids = Vec::new();
+        for (i, v) in corpus.iter().enumerate() {
+            ids.push(db.insert(v, format!("r{i}")).unwrap());
+        }
+
+        let query = &corpus[123];
+        let k = 10;
+        let hits = db.search(query, k, db.n_index_centroids());
+
+        let mut reference: Vec<(u64, f32)> = ids
+            .iter()
+            .map(|&id| {
+                let approx = db.get_approx_vector(id).unwrap();
+                (id, crate::superpose::cosine_sim(query, &approx))
+            })
+            .collect();
+        reference.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        reference.truncate(k);
+
+        assert_eq!(hits.len(), reference.len());
+        for (hit, &(ref_id, ref_score)) in hits.iter().zip(reference.iter()) {
+            assert_eq!(
+                hit.id, ref_id,
+                "top-k ordering diverged from decode baseline"
+            );
+            assert!(
+                (hit.score - ref_score).abs() < 1e-4,
+                "score diverged beyond tolerance: lut={} decode={}",
+                hit.score,
+                ref_score
+            );
+        }
     }
 
     #[test]
