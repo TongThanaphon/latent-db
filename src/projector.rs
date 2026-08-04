@@ -10,8 +10,8 @@
 //! dimensions approximately preserves pairwise distances, which is exactly
 //! the property we need for an approximate index.
 
-use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -42,7 +42,12 @@ impl Projector {
             let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos();
             matrix.push(z * scale);
         }
-        let mut p = Projector { matrix, in_dim, out_dim, commitment: [0u8; 32] };
+        let mut p = Projector {
+            matrix,
+            in_dim,
+            out_dim,
+            commitment: [0u8; 32],
+        };
         p.commit();
         p
     }
@@ -78,13 +83,10 @@ impl Projector {
     pub fn project(&self, v: &[f32]) -> Vec<f32> {
         assert_eq!(v.len(), self.in_dim, "vector dimension mismatch");
         let mut out = vec![0.0f32; self.out_dim];
-        for o in 0..self.out_dim {
+        for (o, out_val) in out.iter_mut().enumerate() {
             let row_off = o * self.in_dim;
-            let mut sum = 0.0f32;
-            for i in 0..self.in_dim {
-                sum += self.matrix[row_off + i] * v[i];
-            }
-            out[o] = sum;
+            let row = &self.matrix[row_off..row_off + self.in_dim];
+            *out_val = row.iter().zip(v.iter()).map(|(m, x)| m * x).sum();
         }
         out
     }

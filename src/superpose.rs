@@ -31,14 +31,14 @@ pub fn circular_convolve(a: &[f32], b: &[f32]) -> Vec<f32> {
     assert_eq!(a.len(), b.len(), "bind operands must match in length");
     let n = a.len();
     let mut out = vec![0.0f32; n];
-    for i in 0..n {
+    for (i, out_val) in out.iter_mut().enumerate() {
         let mut sum = 0.0f32;
-        for j in 0..n {
+        for (j, &aj) in a.iter().enumerate() {
             // (i - j) mod n
             let idx = (i + n - j) % n;
-            sum += a[j] * b[idx];
+            sum += aj * b[idx];
         }
-        out[i] = sum;
+        *out_val = sum;
     }
     out
 }
@@ -46,16 +46,20 @@ pub fn circular_convolve(a: &[f32], b: &[f32]) -> Vec<f32> {
 /// Circular correlation: approximately inverts a circular convolution.
 /// `unbind(convolve(key, value), key) ~= value` (up to noise).
 pub fn circular_correlate(key: &[f32], bundle: &[f32]) -> Vec<f32> {
-    assert_eq!(key.len(), bundle.len(), "unbind operands must match in length");
+    assert_eq!(
+        key.len(),
+        bundle.len(),
+        "unbind operands must match in length"
+    );
     let n = key.len();
     let mut out = vec![0.0f32; n];
-    for i in 0..n {
+    for (i, out_val) in out.iter_mut().enumerate() {
         let mut sum = 0.0f32;
-        for j in 0..n {
+        for (j, &keyj) in key.iter().enumerate() {
             let idx = (i + j) % n;
-            sum += key[j] * bundle[idx];
+            sum += keyj * bundle[idx];
         }
-        out[i] = sum;
+        *out_val = sum;
     }
     out
 }
@@ -88,7 +92,11 @@ pub struct SuperposedSlot {
 
 impl SuperposedSlot {
     pub fn new(dim: usize) -> Self {
-        SuperposedSlot { dim, bundle: vec![0.0; dim], count: 0 }
+        SuperposedSlot {
+            dim,
+            bundle: vec![0.0; dim],
+            count: 0,
+        }
     }
 
     /// Pack one more (key, value) pair into this slot. Cheap: O(dim^2) per
@@ -97,8 +105,8 @@ impl SuperposedSlot {
         assert_eq!(key.len(), self.dim);
         assert_eq!(value.len(), self.dim);
         let bound = circular_convolve(key, value);
-        for i in 0..self.dim {
-            self.bundle[i] += bound[i];
+        for (b, bound_val) in self.bundle.iter_mut().zip(bound.iter()) {
+            *b += bound_val;
         }
         self.count += 1;
     }
@@ -119,7 +127,11 @@ impl SuperposedSlot {
 pub fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
     let denom = norm(a) * norm(b);
-    if denom < 1e-9 { 0.0 } else { dot / denom }
+    if denom < 1e-9 {
+        0.0
+    } else {
+        dot / denom
+    }
 }
 
 #[allow(dead_code)]
@@ -149,9 +161,8 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(0);
         let dim = 64;
 
-        let rand_vec = |rng: &mut StdRng| -> Vec<f32> {
-            (0..dim).map(|_| rng.gen_range(-1.0..1.0)).collect()
-        };
+        let rand_vec =
+            |rng: &mut StdRng| -> Vec<f32> { (0..dim).map(|_| rng.gen_range(-1.0..1.0)).collect() };
 
         let target_key = rand_vec(&mut rng);
         let target_value = rand_vec(&mut rng);
@@ -168,7 +179,11 @@ mod tests {
         }
         // More clutter in the slot should not improve retrieval quality.
         for w in sims.windows(2) {
-            assert!(w[0] + 1e-3 >= w[1], "similarity should not increase with more clutter: {:?}", sims);
+            assert!(
+                w[0] + 1e-3 >= w[1],
+                "similarity should not increase with more clutter: {:?}",
+                sims
+            );
         }
     }
 }

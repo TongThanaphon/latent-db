@@ -165,7 +165,10 @@ impl SteeringEnvelope {
         }
         payload.extend_from_slice(&v.alpha.to_le_bytes());
         let commitment = *blake3::hash(&payload).as_bytes();
-        Self { commitment, payload }
+        Self {
+            commitment,
+            payload,
+        }
     }
 
     /// Whether the envelope's commitment still matches its payload.

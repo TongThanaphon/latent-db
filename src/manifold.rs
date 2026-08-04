@@ -313,21 +313,13 @@ mod tests {
     }
 
     fn build_corridor_graph() -> ViableGraph {
-        build_viable_graph(
-            grid_records(0.25).into_iter(),
-            two_disk_corridor,
-            4,
-            true,
-        )
+        build_viable_graph(grid_records(0.25).into_iter(), two_disk_corridor, 4, true)
     }
 
     #[test]
     fn keeps_only_records_passing_the_predicate() {
         let records = grid_records(0.25);
-        let expected_kept = records
-            .iter()
-            .filter(|(_, v)| two_disk_corridor(v))
-            .count();
+        let expected_kept = records.iter().filter(|(_, v)| two_disk_corridor(v)).count();
         let g = build_viable_graph(records.into_iter(), two_disk_corridor, 4, false);
         assert_eq!(g.n_nodes(), expected_kept);
         assert!(g.n_edges() > 0);
@@ -342,8 +334,7 @@ mod tests {
         let predicate = |z: &[f32]| z[0].abs() < 0.5 || (z[0] - 4.0).abs() < 0.5;
         let records = vec![(0u64, vec![0.0, 0.0]), (1u64, vec![4.0, 0.0])];
 
-        let without_check =
-            build_viable_graph(records.clone().into_iter(), predicate, 1, false);
+        let without_check = build_viable_graph(records.clone().into_iter(), predicate, 1, false);
         assert_eq!(
             without_check.geodesic(0, 1),
             Some(vec![0, 1]),
@@ -388,7 +379,10 @@ mod tests {
         assert_eq!(path.first(), Some(&src));
         assert_eq!(path.last(), Some(&dst));
         for id in &path {
-            assert!(two_disk_corridor(&lookup[id]), "path visited non-viable id {id}");
+            assert!(
+                two_disk_corridor(&lookup[id]),
+                "path visited non-viable id {id}"
+            );
         }
         // A shortest path never revisits a node.
         let mut sorted = path.clone();
@@ -435,7 +429,10 @@ mod tests {
         assert_eq!(walk.len(), 41);
         assert_eq!(walk.first(), Some(&start));
         for id in &walk {
-            assert!(two_disk_corridor(&lookup[id]), "walk visited non-viable id {id}");
+            assert!(
+                two_disk_corridor(&lookup[id]),
+                "walk visited non-viable id {id}"
+            );
         }
     }
 

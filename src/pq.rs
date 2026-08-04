@@ -32,10 +32,13 @@ impl PqCodec {
         iterations: usize,
         seed: u64,
     ) -> Self {
-        assert!(!training_vectors.is_empty(), "need at least one training vector");
+        assert!(
+            !training_vectors.is_empty(),
+            "need at least one training vector"
+        );
         let dim = training_vectors[0].len();
         assert!(
-            dim % n_subspaces == 0,
+            dim.is_multiple_of(n_subspaces),
             "dim ({dim}) must be divisible by n_subspaces ({n_subspaces})"
         );
         let sub_dim = dim / n_subspaces;
@@ -46,11 +49,22 @@ impl PqCodec {
                 .iter()
                 .map(|v| v[s * sub_dim..(s + 1) * sub_dim].to_vec())
                 .collect();
-            let centroids = kmeans(&sub_vectors, n_centroids, iterations, seed.wrapping_add(s as u64));
+            let centroids = kmeans(
+                &sub_vectors,
+                n_centroids,
+                iterations,
+                seed.wrapping_add(s as u64),
+            );
             codebooks.push(centroids);
         }
 
-        PqCodec { dim, n_subspaces, sub_dim, n_centroids, codebooks }
+        PqCodec {
+            dim,
+            n_subspaces,
+            sub_dim,
+            n_centroids,
+            codebooks,
+        }
     }
 
     pub fn dim(&self) -> usize {
@@ -85,8 +99,8 @@ impl PqCodec {
     pub fn decode(&self, codes: &[u8]) -> Vec<f32> {
         assert_eq!(codes.len(), self.n_subspaces, "code length mismatch");
         let mut out = Vec::with_capacity(self.dim);
-        for s in 0..self.n_subspaces {
-            let c_idx = codes[s] as usize;
+        for (s, &code) in codes.iter().enumerate() {
+            let c_idx = code as usize;
             out.extend_from_slice(&self.codebooks[s][c_idx]);
         }
         out
@@ -125,9 +139,7 @@ pub(crate) fn kmeans(data: &[Vec<f32>], k: usize, iterations: usize, seed: u64) 
     let dim = data[0].len();
 
     // Random initial centroids drawn from the data itself (Forgy init).
-    let mut centroids: Vec<Vec<f32>> = (0..k)
-        .map(|_| data[rng.gen_range(0..n)].clone())
-        .collect();
+    let mut centroids: Vec<Vec<f32>> = (0..k).map(|_| data[rng.gen_range(0..n)].clone()).collect();
 
     let mut assignments = vec![0usize; n];
 

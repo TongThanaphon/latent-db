@@ -49,7 +49,9 @@ pub struct MerkleTree {
 impl MerkleTree {
     pub fn build(leaf_hashes: Vec<Digest>) -> Self {
         if leaf_hashes.is_empty() {
-            return MerkleTree { levels: vec![Vec::new()] };
+            return MerkleTree {
+                levels: vec![Vec::new()],
+            };
         }
         let mut levels = vec![leaf_hashes];
         while levels.last().unwrap().len() > 1 {
@@ -99,7 +101,11 @@ impl MerkleTree {
             siblings.push(sibling);
             idx /= 2;
         }
-        Some(MerkleProof { leaf_index: leaf_index as u64, leaf_hash, siblings })
+        Some(MerkleProof {
+            leaf_index: leaf_index as u64,
+            leaf_hash,
+            siblings,
+        })
     }
 }
 
@@ -118,7 +124,7 @@ impl MerkleProof {
         let mut current = self.leaf_hash;
         let mut idx = self.leaf_index;
         for sibling in &self.siblings {
-            current = if idx % 2 == 0 {
+            current = if idx.is_multiple_of(2) {
                 hash_pair(&current, sibling)
             } else {
                 hash_pair(sibling, &current)

@@ -608,10 +608,16 @@ mod tests {
         // The 5 highest (newest) ids should be the ones still present.
         let newest: Vec<u64> = ids[ids.len() - 5..].to_vec();
         for id in newest {
-            assert!(db.get_metadata(id).is_some(), "newest record {id} should survive");
+            assert!(
+                db.get_metadata(id).is_some(),
+                "newest record {id} should survive"
+            );
         }
         for id in &ids[..ids.len() - 5] {
-            assert!(db.get_metadata(*id).is_none(), "oldest record {id} should be evicted");
+            assert!(
+                db.get_metadata(*id).is_none(),
+                "oldest record {id} should be evicted"
+            );
         }
     }
 
@@ -644,7 +650,9 @@ mod tests {
                 corpus.push(v);
             }
         }
-        let outlier: Vec<f32> = (0..16).map(|i| if i % 2 == 0 { 50.0 } else { -50.0 }).collect();
+        let outlier: Vec<f32> = (0..16)
+            .map(|i| if i % 2 == 0 { 50.0 } else { -50.0 })
+            .collect();
         corpus.push(outlier.clone());
 
         let mut db = LatentDb::build(&corpus, 2, 8, 2, 8, 26);
