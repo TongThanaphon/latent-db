@@ -1,2 +1,3 @@
 /target
 /katgpt-rs
+.claude/settings.local.json
