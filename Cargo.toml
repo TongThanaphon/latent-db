@@ -35,6 +35,23 @@ getrandom = { version = "0.2", features = ["js"] }
 name = "demo"
 path = "examples/demo.rs"
 
+# harness = false: hand-rolled std::time::Instant timers, no criterion dev-dep
+# (matches katgpt-rs's own bench convention -- see benches/support.rs).
+[[bench]]
+name = "search_bench"
+path = "benches/search_bench.rs"
+harness = false
+
+[[bench]]
+name = "merkle_proof_bench"
+path = "benches/merkle_proof_bench.rs"
+harness = false
+
+[[bench]]
+name = "viable_graph_bench"
+path = "benches/viable_graph_bench.rs"
+harness = false
+
 [dev-dependencies]
 anyhow = "1.0.104"
 axum = "0.8"

@@ -39,6 +39,7 @@
 //!   results toward a concept axis without retraining anything. Inspired by
 //!   katgpt-rs's Latent Field Steering (Plan 309).
 
+pub mod alloc;
 pub mod db;
 pub mod index;
 pub mod manifold;
@@ -58,3 +59,17 @@ pub use pq::PqCodec;
 pub use projector::Projector;
 pub use steering::{SteeringEnvelope, SteeringError, SteeringVector};
 pub use superpose::{circular_convolve, circular_correlate, cosine_sim, SuperposedSlot};
+
+// Debug-only global allocator (see `alloc` module docs): tracks per-thread
+// allocation count/bytes so `*_alloc_check` tests and benches can assert a
+// hot path's allocation behavior. Installed here, at the crate root, rather
+// than gated on `cfg(test)`, so it's also active for `tests/` integration
+// tests and `benches/` binaries in this package -- both link this crate as a
+// plain rlib dependency, where `cfg(test)` is never set on *this* crate.
+// Compiles away entirely in release builds (`cargo bench` defaults to the
+// release profile, so timing benches see zero counting overhead). Excluded
+// on wasm32 since the `wasm` feature's cdylib output isn't a benchmarking
+// target and doesn't need allocation tracking.
+#[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
+#[global_allocator]
+static GLOBAL_ALLOC: alloc::TrackingAllocator = alloc::TrackingAllocator;
