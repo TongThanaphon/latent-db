@@ -21,9 +21,11 @@
 //! parameter.
 //!
 //! Graph build is O(n^2) (pairwise distances for kNN) and, like the
-//! batch-trained PQ codebooks and the from-scratch `merkle_tree()`, is meant
-//! to be rebuilt whenever the underlying record set changes rather than
-//! maintained incrementally -- fine at this crate's prototype scale.
+//! batch-trained PQ codebooks and the per-mutation-rebuilt `merkle_tree()`
+//! (cached across calls, but still a full rebuild the next time it's
+//! touched after an `insert`/`remove`), is meant to be rebuilt whenever the
+//! underlying record set changes rather than maintained incrementally --
+//! fine at this crate's prototype scale.
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};

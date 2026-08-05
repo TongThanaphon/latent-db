@@ -169,12 +169,17 @@ git config core.hooksPath .githooks
   MUX-Latent (which is lossless — see the note above), there's no fallback
   copy of the original value retained here. Don't use it where exact recall
   matters; use the main `LatentDb` PQ + index path for that instead.
-- **`merkle_root()`/`merkle_proof()` rebuild the whole Merkle tree from
-  scratch on every call** (O(n log n) over the current record count) rather
-  than maintaining it incrementally on insert/remove. Fine at this crate's
-  prototype scale, same tradeoff as the batch-trained PQ codebooks and
-  centroid index; a production version would want an incremental/append-only
-  tree (e.g. a Merkle Mountain Range) instead.
+- **`merkle_root()`/`merkle_proof()` cache the built tree (all levels, not
+  just the root) rather than maintaining it incrementally on insert/remove.**
+  The first call after construction, or after the most recent `insert`/
+  `remove`, pays a full O(n log n) rebuild over the current record count and
+  fills the cache; every further call before the next mutation reuses it, so
+  `merkle_proof(id)` becomes an O(log n) id lookup + sibling-path read
+  instead of another full rebuild. That still means N proof calls between
+  two mutations cost one rebuild instead of N, not a truly incremental tree
+  that updates in O(log n) per `insert`/`remove` — a production version
+  would want that (e.g. a Merkle Mountain Range) to avoid the O(n log n)
+  rebuild cost landing on whichever call happens to follow a mutation.
 - **`record_budget` + `EvictionPolicy` are named after katgpt-rs's
   `LatentContextBuffer` (`mux_latent/buffer.rs`), but are a from-scratch
   design, not a port** — a closer look at the real source turned up two

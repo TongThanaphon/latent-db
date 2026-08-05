@@ -16,6 +16,7 @@
 //! | Viable Manifold Graph     | `manifold::ViableGraph` -- kNN graph over a predicate-filtered record subset, `geodesic()` / `random_walk()` traversal (`build_viable_graph()`) |
 //! | Latent Field Steering     | `steering::SteeringVector` -- frozen direction + strength shifts the query before search (`search_steered()`) |
 
+use std::cell::{Ref, RefCell};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -261,6 +262,17 @@ pub enum EvictionPolicy {
     LowestEnergy,
 }
 
+/// Build products [`LatentDb::ensure_merkle_cache`] caches across
+/// `merkle_root()`/`merkle_proof()` calls: the tree itself (see `merkle.rs`
+/// -- it already holds every level, not just the root) plus the ascending
+/// id list mapping a record id to its leaf index (`ids[i]` is the id of leaf
+/// `i`), so `merkle_proof(id)` can binary-search straight to a leaf index
+/// instead of the linear scan a fresh `merkle_leaves()` call would need.
+struct MerkleCache {
+    ids: Vec<u64>,
+    tree: MerkleTree,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct LatentDb {
     dim: usize,
@@ -281,6 +293,17 @@ pub struct LatentDb {
     /// (de)serialization -- re-sized lazily on first use after `load()`.
     #[serde(skip)]
     scratch: Vec<f32>,
+    /// Lazily-built Merkle tree cache, `RefCell`-wrapped so `merkle_root()`/
+    /// `merkle_proof()` can stay `&self` while still filling it in on first
+    /// use. `None` means "rebuild on next access" -- true right after
+    /// construction/deserialization, and set by `invalidate_merkle_cache()`
+    /// after every `insert`/`remove`. See `ensure_merkle_cache`. This is the
+    /// one field that makes `LatentDb` no longer auto-`Sync` (every other
+    /// field is a plain, `Sync` value) -- fine today since nothing in this
+    /// crate shares a `LatentDb` across threads, but worth knowing if that
+    /// ever changes.
+    #[serde(skip)]
+    merkle_cache: RefCell<Option<MerkleCache>>,
 }
 
 pub struct SearchHit {
@@ -354,6 +377,7 @@ impl LatentDb {
             record_budget: 0,
             eviction_policy: EvictionPolicy::OldestFirst,
             scratch: vec![0.0; sketch_dim],
+            merkle_cache: RefCell::new(None),
         }
     }
 
@@ -414,6 +438,7 @@ impl LatentDb {
             .insert(id, hash, &metadata, |slot| pq.encode_into(embedding, slot));
 
         self.hash_to_id.insert(hash, id);
+        self.invalidate_merkle_cache();
         self.enforce_budget();
         Ok(id)
     }
@@ -422,7 +447,17 @@ impl LatentDb {
         if let Some(hash) = self.records.remove(id) {
             self.hash_to_id.remove(&hash);
             self.index.remove(id);
+            self.invalidate_merkle_cache();
         }
+    }
+
+    /// Drop the cached Merkle tree so the next `merkle_root()`/
+    /// `merkle_proof()` call rebuilds it from the live record set. Called by
+    /// `insert`/`remove` whenever they actually change the stored record
+    /// set (not on `insert`'s de-dup fast path, which returns before this
+    /// point without touching any record).
+    fn invalidate_merkle_cache(&mut self) {
+        *self.merkle_cache.get_mut() = None;
     }
 
     /// Reconstruct the (approximate, PQ-decoded) embedding for a record.
@@ -655,15 +690,36 @@ impl LatentDb {
             .collect()
     }
 
-    /// Build a fresh Merkle tree over every currently-stored record. This
-    /// is rebuilt from scratch on every call rather than maintained
-    /// incrementally on insert/remove -- fine at this crate's prototype
-    /// scale (same tradeoff as the batch-trained PQ codebooks and centroid
-    /// index, see the design notes), and it guarantees `merkle_root()` /
-    /// `merkle_proof()` always reflect the live record set exactly, with no
-    /// risk of a stale cached tree drifting out of sync.
+    /// Fill `merkle_cache` from the live record set if it's currently empty
+    /// (construction/deserialization, or the most recent `insert`/`remove`
+    /// invalidated it via `invalidate_merkle_cache`). A no-op otherwise, so
+    /// any number of `merkle_root()`/`merkle_proof()` calls between two
+    /// mutations pay this O(n log n) `merkle_leaves()` rehash + tree build
+    /// exactly once, not once per call.
+    fn ensure_merkle_cache(&self) {
+        if self.merkle_cache.borrow().is_some() {
+            return;
+        }
+        let leaves = self.merkle_leaves();
+        let ids = leaves.iter().map(|(id, _)| *id).collect();
+        let tree = MerkleTree::build(leaves.into_iter().map(|(_, h)| h).collect());
+        *self.merkle_cache.borrow_mut() = Some(MerkleCache { ids, tree });
+    }
+
+    /// Fill the cache if needed (`ensure_merkle_cache`), then hand back a
+    /// borrow of it -- the one place `merkle_tree`/`merkle_root`/
+    /// `merkle_proof` all go through, so there's a single ensure-then-borrow
+    /// path instead of three copies of it.
+    fn cached_merkle(&self) -> Ref<'_, MerkleCache> {
+        self.ensure_merkle_cache();
+        Ref::map(self.merkle_cache.borrow(), |cache| cache.as_ref().unwrap())
+    }
+
+    /// The Merkle tree over every currently-stored record, reusing the
+    /// cached build (see `ensure_merkle_cache`) rather than rebuilding from
+    /// scratch when nothing has changed since the last call.
     pub fn merkle_tree(&self) -> MerkleTree {
-        MerkleTree::build(self.merkle_leaves().into_iter().map(|(_, h)| h).collect())
+        self.cached_merkle().tree.clone()
     }
 
     /// Root commitment over every currently-stored record. Publish or store
@@ -672,16 +728,23 @@ impl LatentDb {
     /// record was included in that checkpoint without needing the whole
     /// database.
     pub fn merkle_root(&self) -> Digest {
-        self.merkle_tree().root()
+        self.cached_merkle().tree.root()
     }
 
     /// Inclusion proof that record `id` is part of the current
     /// `merkle_root()`. Returns `None` if `id` isn't currently stored.
+    ///
+    /// Reuses the cached tree and id list when nothing has changed since the
+    /// last call (see `ensure_merkle_cache`): once cached, this is an O(log
+    /// n) binary search for `id`'s leaf index followed by an O(log n)
+    /// sibling-path lookup against the tree's cached levels (`MerkleTree`
+    /// keeps every level, not just the root -- see `merkle.rs`), instead of
+    /// the full O(n log n) rehash + rebuild the old always-rebuild
+    /// implementation paid on every single call.
     pub fn merkle_proof(&self, id: u64) -> Option<MerkleProof> {
-        let leaves = self.merkle_leaves();
-        let position = leaves.iter().position(|(lid, _)| *lid == id)?;
-        let tree = MerkleTree::build(leaves.into_iter().map(|(_, h)| h).collect());
-        tree.proof(position)
+        let cache = self.cached_merkle();
+        let position = cache.ids.binary_search(&id).ok()?;
+        cache.tree.proof(position)
     }
 
     /// Persist the whole DB (codebooks, index, compressed records) to disk.
@@ -812,11 +875,15 @@ mod tests {
         for (i, v) in corpus.iter().enumerate() {
             db.insert(v, format!("r{i}")).unwrap();
         }
+        let root_before_save = db.merkle_root();
         let tmp = std::env::temp_dir().join("latent-db_test.bin");
         db.save(&tmp).unwrap();
         let loaded = LatentDb::load(&tmp).unwrap();
         assert_eq!(loaded.len(), db.len());
         assert_eq!(loaded.get_metadata(0), db.get_metadata(0));
+        // `merkle_cache` is `#[serde(skip)]`, so this exercises a fresh
+        // post-load build of the cache, not a (nonexistent) deserialized one.
+        assert_eq!(loaded.merkle_root(), root_before_save);
         std::fs::remove_file(tmp).ok();
     }
 
@@ -932,6 +999,54 @@ mod tests {
         let id = db.insert(&corpus[0], "x").unwrap();
         db.remove(id);
         assert!(db.merkle_proof(id).is_none());
+    }
+
+    /// Repeated `merkle_root()`/`merkle_proof()` calls with no mutation in
+    /// between must keep returning the exact same values as the cached tree
+    /// is reused -- proves reusing the cache doesn't silently drift from
+    /// what a fresh rebuild would produce.
+    #[test]
+    fn repeated_merkle_calls_without_mutation_are_stable() {
+        let corpus = synthetic_corpus(25, 16, 14);
+        let mut db = LatentDb::build(&corpus, 2, 8, 4, 8, 15);
+        let mut ids = Vec::new();
+        for (i, v) in corpus.iter().enumerate() {
+            ids.push(db.insert(v, format!("r{i}")).unwrap());
+        }
+
+        let root_a = db.merkle_root();
+        let root_b = db.merkle_root();
+        assert_eq!(root_a, root_b);
+
+        for &id in &ids {
+            let proof_a = db.merkle_proof(id).unwrap();
+            let proof_b = db.merkle_proof(id).unwrap();
+            assert_eq!(proof_a.leaf_index, proof_b.leaf_index);
+            assert_eq!(proof_a.leaf_hash, proof_b.leaf_hash);
+            assert_eq!(proof_a.siblings, proof_b.siblings);
+            assert!(proof_a.verify(&root_a));
+        }
+    }
+
+    /// A record inserted after the cache was already warmed by an earlier
+    /// `merkle_root()`/`merkle_proof()` call must still show up: the cache
+    /// has to be invalidated and rebuilt on `insert`, not served stale.
+    #[test]
+    fn merkle_proof_sees_records_inserted_after_the_cache_was_warmed() {
+        let corpus = synthetic_corpus(10, 16, 16);
+        let mut db = LatentDb::build(&corpus, 2, 8, 4, 8, 17);
+        let first_id = db.insert(&corpus[0], "first").unwrap();
+
+        // Warm the cache before the second insert.
+        let _ = db.merkle_root();
+        let _ = db.merkle_proof(first_id);
+
+        let second_id = db.insert(&corpus[1], "second").unwrap();
+        let root = db.merkle_root();
+        let proof = db
+            .merkle_proof(second_id)
+            .expect("record inserted after cache warm-up should still be provable");
+        assert!(proof.verify(&root));
     }
 
     #[test]
