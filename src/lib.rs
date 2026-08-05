@@ -56,8 +56,18 @@
 //!   paths diverge from a shared start. Ported from katgpt-rs's
 //!   `latent_trajectory_geometry` (arXiv:2606.09287 distillation), which is
 //!   pure geometry over a vector sequence with no game-specific assumptions.
+//! - **`bandit`** -- `LatentDb::build_region_tree()` builds a `RegionTree`:
+//!   a hierarchical clustering (PCA + recursive k-means) of currently-stored
+//!   record embeddings into regions, with `RegionTree::sample()` descending
+//!   it via Thompson sampling to pick a region under uncertainty and
+//!   `RegionTree::observe()` updating a region's reward belief from
+//!   feedback -- reward-driven exploration, distinct from
+//!   `random_walk`/`weighted_random_walk`'s distance- or predicate-driven
+//!   traversal. Ported from katgpt-rs's `manifold_bandit::LatentTaskTree`
+//!   (arXiv:2606.19750 distillation).
 
 pub mod alloc;
+pub mod bandit;
 pub mod db;
 pub mod index;
 pub mod manifold;
@@ -71,6 +81,7 @@ pub mod trajectory;
 #[cfg(feature = "wasm")]
 pub mod wasm;
 
+pub use bandit::{RegionTree, RegionTreeConfig};
 pub use db::{EvictionPolicy, LatentDb, LatentDbError, SearchHit};
 pub use index::CentroidIndex;
 pub use manifold::{build_viable_graph, BoundaryClassId, BoundaryClasses, ViableGraph};

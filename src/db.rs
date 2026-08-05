@@ -15,6 +15,7 @@
 //! | MerkleOctree / MerkleProof | `merkle` module -- per-record inclusion proofs |
 //! | Viable Manifold Graph     | `manifold::ViableGraph` -- kNN graph over a predicate-filtered record subset, `geodesic()` / `random_walk()` traversal (`build_viable_graph()`) |
 //! | Latent Field Steering     | `steering::SteeringVector` -- frozen direction + strength shifts the query before search (`search_steered()`) |
+//! | Manifold Bandit / LatentTaskTree | `bandit::RegionTree` -- PCA + recursive-k-means region tree over stored records, Thompson-sampled (`sample()`) and reward-updated (`observe()`) (`build_region_tree()`) |
 
 use std::cell::{Ref, RefCell};
 use std::collections::HashMap;
@@ -24,6 +25,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::bandit::{RegionTree, RegionTreeConfig};
 use crate::index::CentroidIndex;
 use crate::manifold::{self, ViableGraph};
 use crate::merkle::{self, Digest, MerkleProof, MerkleTree};
@@ -566,6 +568,32 @@ impl LatentDb {
             .ids()
             .map(|id| (id, self.pq.decode(self.records.codes(id).unwrap())));
         manifold::build_viable_graph(records, predicate, k_nearest, edge_midpoint_check)
+    }
+
+    /// Build a [`RegionTree`] over every currently-stored record's
+    /// approximate decoded vector: a hierarchical clustering (PCA +
+    /// recursive k-means, see the `bandit` module) whose leaves are
+    /// individual records and whose internal nodes are regions. Thompson-
+    /// sample a region to explore next via `RegionTree::sample()`, then feed
+    /// back how useful it was via `RegionTree::observe()`.
+    ///
+    /// Ids are visited in ascending order before decoding, the same
+    /// determinism guarantee `build_viable_graph()` makes -- so the
+    /// resulting tree's k-means splits (and therefore `sample()`'s output
+    /// for a given seed) are stable across rebuilds of the same record set.
+    ///
+    /// Like `build_viable_graph()`, this is meant to be rebuilt when the
+    /// record set changes meaningfully rather than maintained incrementally.
+    ///
+    /// # Panics
+    /// Panics if the database is empty -- see [`RegionTree::build`].
+    pub fn build_region_tree(&self, config: RegionTreeConfig) -> RegionTree {
+        let records: Vec<(u64, Vec<f32>)> = self
+            .records
+            .ids()
+            .map(|id| (id, self.pq.decode(self.records.codes(id).unwrap())))
+            .collect();
+        RegionTree::build(&records, config)
     }
 
     /// Compression ratio achieved by PQ storage vs. keeping raw f32 vectors.
@@ -1227,5 +1255,24 @@ mod tests {
         for id in walk {
             assert!(db.get_approx_vector(id).unwrap()[0] > 0.0);
         }
+    }
+
+    #[test]
+    fn build_region_tree_covers_every_stored_record() {
+        let corpus = synthetic_corpus(60, 16, 90);
+        let mut db = LatentDb::build(&corpus, 4, 16, 8, 8, 91);
+        let mut ids = Vec::new();
+        for (i, v) in corpus.iter().enumerate() {
+            ids.push(db.insert(v, format!("r{i}")).unwrap());
+        }
+
+        let tree = db.build_region_tree(RegionTreeConfig::default());
+        assert_eq!(tree.num_arms(), db.len());
+        for &id in &ids {
+            assert!(tree.leaf_belief(id).is_some());
+        }
+
+        let arm = tree.sample(1);
+        assert!(ids.contains(&arm));
     }
 }
