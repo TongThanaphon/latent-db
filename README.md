@@ -152,6 +152,18 @@ git config core.hooksPath .githooks
   well at the scale this demo runs (hundreds–thousands of vectors) but
   large-dimensional, large-N production workloads would want a proper ANN
   library.
+- **Record storage (PQ codes + metadata) is a flat arena keyed by id, and
+  ids are never reused.** Each id gets a fixed-stride slot in one
+  pre-allocated `codes` buffer plus an (offset, len) span into one
+  append-only `meta_bytes` buffer; growing those buffers (geometric
+  doubling) is the only point `insert` touches the global allocator, so
+  steady-state insert/lookup within capacity doesn't. The tradeoff: neither
+  buffer reclaims space on `remove` — a removed id's slot and metadata span
+  just sit dead, gated out by a liveness bit — so memory tracks the
+  high-water mark (`next_id`), not `len()`. A DB that churns heavily under
+  `record_budget` (insert, evict, insert, evict, ...) grows without bound
+  rather than staying flat at the budget size; a production version would
+  want periodic compaction or a free-list of reclaimed slots.
 - **`SuperposedSlot` retrieval is inherently lossy and noisy**, by
   construction — that's the whole point, and unlike katgpt-rs's real
   MUX-Latent (which is lossless — see the note above), there's no fallback

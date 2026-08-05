@@ -81,14 +81,23 @@ impl Projector {
 
     /// Project a full-size vector down to the sketch space.
     pub fn project(&self, v: &[f32]) -> Vec<f32> {
-        assert_eq!(v.len(), self.in_dim, "vector dimension mismatch");
         let mut out = vec![0.0f32; self.out_dim];
+        self.project_into(v, &mut out);
+        out
+    }
+
+    /// Same as [`Self::project`], but writes into a caller-provided buffer
+    /// (`out.len() == self.out_dim()`) instead of allocating a fresh `Vec`.
+    /// Lets a hot path (e.g. `LatentDb::insert`) reuse one scratch buffer
+    /// across calls instead of paying a heap allocation every time.
+    pub fn project_into(&self, v: &[f32], out: &mut [f32]) {
+        assert_eq!(v.len(), self.in_dim, "vector dimension mismatch");
+        assert_eq!(out.len(), self.out_dim, "output buffer size mismatch");
         for (o, out_val) in out.iter_mut().enumerate() {
             let row_off = o * self.in_dim;
             let row = &self.matrix[row_off..row_off + self.in_dim];
             *out_val = row.iter().zip(v.iter()).map(|(m, x)| m * x).sum();
         }
-        out
     }
 }
 
@@ -130,5 +139,24 @@ mod tests {
         let bytes = bincode::serialize(&p).unwrap();
         let reloaded: Projector = bincode::deserialize(&bytes).unwrap();
         assert!(reloaded.verify());
+    }
+
+    #[test]
+    fn project_into_matches_project() {
+        let p = Projector::new(64, 8, 42);
+        let v: Vec<f32> = (0..64).map(|i| i as f32 * 0.01).collect();
+        let expected = p.project(&v);
+        let mut out = vec![0.0f32; 8];
+        p.project_into(&v, &mut out);
+        assert_eq!(expected, out);
+    }
+
+    #[test]
+    #[should_panic(expected = "output buffer size mismatch")]
+    fn project_into_rejects_wrong_output_length() {
+        let p = Projector::new(64, 8, 42);
+        let v: Vec<f32> = vec![1.0; 64];
+        let mut out = vec![0.0f32; 4];
+        p.project_into(&v, &mut out);
     }
 }

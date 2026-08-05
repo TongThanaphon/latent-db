@@ -33,6 +33,13 @@ impl WasmLatentDb {
     pub fn from_bytes(bytes: &[u8]) -> Result<WasmLatentDb, JsValue> {
         let inner: LatentDb =
             bincode::deserialize(bytes).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        // Doesn't go through `LatentDb::load` (`std::fs` has no real
+        // backing on wasm32-unknown-unknown), so it must run the same
+        // post-deserialize check `load` does -- see
+        // `LatentDb::validate_after_deserialize`'s doc comment.
+        inner
+            .validate_after_deserialize()
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
         Ok(WasmLatentDb { inner })
     }
 

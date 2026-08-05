@@ -30,11 +30,212 @@ use crate::pq::PqCodec;
 use crate::projector::Projector;
 use crate::steering::SteeringVector;
 
+/// Flat, pre-allocated storage for every record's PQ codes + metadata,
+/// indexed directly by record id: `codes[id * code_len .. +code_len]`, a
+/// parallel `hash`/`meta_span`/`live` entry per id. Ids are assigned once by
+/// `LatentDb::next_id` and never reused, so `id` doubles as a stable slot
+/// index -- no separate id-to-slot lookup is needed. `insert`/`remove`/reads
+/// within capacity just index into already-allocated memory; the only
+/// points this ever touches the global allocator are the four parallel
+/// arrays' own geometric-doubling growth (like `Vec::push`'s amortized
+/// growth), plus `meta_bytes` growing on that same amortized schedule, one
+/// buffer below.
+///
+/// `meta_bytes` is a single append-only buffer holding every record's
+/// metadata concatenated together, sliced per-record via `meta_span`
+/// (offset, len) -- mirrors the "one big buffer, no per-record Vec/String"
+/// pattern katgpt-rs uses for its own KV-cache and slot-table storage,
+/// applied to metadata as well as codes. It grows independently of the
+/// other four arrays (its own `Vec<u8>`, sized by total metadata bytes
+/// rather than record count), via `Vec::extend_from_slice`'s own amortized
+/// growth rather than `ensure_capacity`. Removing a record clears its
+/// `live` bit but does not reclaim its `meta_bytes` span or its `codes`
+/// slot; see the README for what that means for long-running
+/// eviction-heavy DBs.
 #[derive(Serialize, Deserialize)]
-struct StoredRecord {
-    hash: u64,
+struct RecordArena {
+    code_len: usize,
     codes: Vec<u8>,
-    metadata: String,
+    hash: Vec<u64>,
+    /// (offset, len) into `meta_bytes` for each id's metadata.
+    meta_span: Vec<(u32, u32)>,
+    meta_bytes: Vec<u8>,
+    live: Vec<bool>,
+    len: usize,
+}
+
+impl RecordArena {
+    fn new(code_len: usize) -> Self {
+        RecordArena {
+            code_len,
+            codes: Vec::new(),
+            hash: Vec::new(),
+            meta_span: Vec::new(),
+            meta_bytes: Vec::new(),
+            live: Vec::new(),
+            len: 0,
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.live.len()
+    }
+
+    /// Grow every parallel array so slot `min_capacity - 1` is addressable.
+    /// Doubles (like `Vec::push`'s own amortized growth) rather than
+    /// growing to the exact minimum, so a run of sequential ids only hits
+    /// the allocator O(log n) times, not once per id.
+    fn ensure_capacity(&mut self, min_capacity: usize) {
+        if self.capacity() >= min_capacity {
+            return;
+        }
+        let new_capacity = min_capacity.max(self.capacity().saturating_mul(2)).max(16);
+        self.codes.resize(new_capacity * self.code_len, 0);
+        self.hash.resize(new_capacity, 0);
+        self.meta_span.resize(new_capacity, (0, 0));
+        self.live.resize(new_capacity, false);
+    }
+
+    /// Store record `id`: `write_codes` is applied directly to this id's
+    /// arena slot (no intermediate `Vec<u8>` -- the caller encodes straight
+    /// into arena memory), and `metadata`'s bytes are appended to the flat
+    /// metadata buffer. The only allocations this can cause are the arena's
+    /// own amortized growth: `ensure_capacity` growing to fit `id`, and/or
+    /// `meta_bytes` growing to fit the appended metadata.
+    fn insert(&mut self, id: u64, hash: u64, metadata: &str, write_codes: impl FnOnce(&mut [u8])) {
+        let idx = id as usize;
+        self.ensure_capacity(idx + 1);
+
+        let stride = self.code_len;
+        write_codes(&mut self.codes[idx * stride..idx * stride + stride]);
+        self.hash[idx] = hash;
+
+        let offset = self.meta_bytes.len() as u32;
+        self.meta_bytes.extend_from_slice(metadata.as_bytes());
+        self.meta_span[idx] = (offset, metadata.len() as u32);
+
+        if !self.live[idx] {
+            self.len += 1;
+        }
+        self.live[idx] = true;
+    }
+
+    fn is_live(&self, id: u64) -> bool {
+        (id as usize) < self.live.len() && self.live[id as usize]
+    }
+
+    fn codes(&self, id: u64) -> Option<&[u8]> {
+        if !self.is_live(id) {
+            return None;
+        }
+        let idx = id as usize;
+        let start = idx * self.code_len;
+        Some(&self.codes[start..start + self.code_len])
+    }
+
+    fn hash(&self, id: u64) -> Option<u64> {
+        self.is_live(id).then(|| self.hash[id as usize])
+    }
+
+    fn metadata(&self, id: u64) -> Option<&str> {
+        if !self.is_live(id) {
+            return None;
+        }
+        let (offset, len) = self.meta_span[id as usize];
+        let bytes = &self.meta_bytes[offset as usize..offset as usize + len as usize];
+        // Valid UTF-8 and in-bounds by construction: `insert` is the only
+        // writer and always appends a whole `&str`'s own bytes, and
+        // `LatentDb::validate_after_deserialize` (called by every
+        // deserialization entry point -- `load`, `WasmLatentDb::from_bytes`)
+        // re-checks both properties for arenas that didn't come from
+        // `insert` at all. A panic here means one of those two guarantees
+        // has a bug, not that untrusted bytes reached this unchecked.
+        Some(std::str::from_utf8(bytes).expect("metadata bytes are valid utf8 by construction"))
+    }
+
+    /// Clear id's live bit and return its stored hash, if it was live.
+    /// Leaves its `codes` slot and `meta_bytes` span as unreclaimed dead
+    /// space (see the struct docs and README).
+    fn remove(&mut self, id: u64) -> Option<u64> {
+        if !self.is_live(id) {
+            return None;
+        }
+        let idx = id as usize;
+        self.live[idx] = false;
+        self.len -= 1;
+        Some(self.hash[idx])
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Every currently-live id, in ascending order (a side effect of
+    /// scanning slots 0..capacity in order -- ids are never reused, so this
+    /// is also insertion order among still-live records).
+    fn ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.live
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, &live)| live.then_some(idx as u64))
+    }
+
+    /// Cross-field invariant check for an arena that may not have come from
+    /// `insert` -- i.e. one just produced by `bincode::deserialize`.
+    /// `insert`/`remove` above are the only writers on the normal path and
+    /// always keep these invariants true by construction, so this is never
+    /// called there; it exists purely so a corrupted or hand-crafted byte
+    /// stream fails here, at the deserialization boundary, instead of
+    /// succeeding and then panicking later inside `codes()`/`metadata()`
+    /// (e.g. from deep inside `search()` or `merkle_leaves()`). Mirrors
+    /// what bincode's own `String`/`Vec<u8>` deserialization already
+    /// guaranteed for the old per-record `HashMap<u64, StoredRecord>`
+    /// storage this arena replaced.
+    fn validate(&self) -> Result<(), String> {
+        let capacity = self.live.len();
+        if self.codes.len() != capacity * self.code_len {
+            return Err(format!(
+                "codes length {} does not match capacity {capacity} * code_len {}",
+                self.codes.len(),
+                self.code_len
+            ));
+        }
+        if self.hash.len() != capacity || self.meta_span.len() != capacity {
+            return Err(format!(
+                "hash length {} / meta_span length {} does not match capacity {capacity}",
+                self.hash.len(),
+                self.meta_span.len()
+            ));
+        }
+        let live_count = self.live.iter().filter(|&&live| live).count();
+        if live_count != self.len {
+            return Err(format!(
+                "len {} does not match {live_count} live slots",
+                self.len
+            ));
+        }
+        for (idx, &live) in self.live.iter().enumerate() {
+            if !live {
+                continue;
+            }
+            let (offset, span_len) = self.meta_span[idx];
+            let end = offset as usize + span_len as usize;
+            let bytes = self.meta_bytes.get(offset as usize..end).ok_or_else(|| {
+                format!(
+                    "id {idx}: metadata span {offset}..{end} is out of bounds \
+                     (meta_bytes len {})",
+                    self.meta_bytes.len()
+                )
+            })?;
+            std::str::from_utf8(bytes)
+                .map_err(|e| format!("id {idx}: metadata bytes are not valid utf8: {e}"))?;
+        }
+        Ok(())
+    }
 }
 
 /// Eviction policy applied once `record_budget` is exceeded.
@@ -66,7 +267,7 @@ pub struct LatentDb {
     projector: Projector,
     pq: PqCodec,
     index: CentroidIndex,
-    records: HashMap<u64, StoredRecord>,
+    records: RecordArena,
     /// content hash -> id, for de-duplication on insert
     hash_to_id: HashMap<u64, u64>,
     next_id: u64,
@@ -74,6 +275,12 @@ pub struct LatentDb {
     /// every `insert()` and whenever changed via `set_record_budget()`.
     record_budget: usize,
     eviction_policy: EvictionPolicy,
+    /// Reusable `projector.project_into` output buffer for `insert`, so it
+    /// doesn't need to allocate a fresh `Vec<f32>` every call just to
+    /// immediately hand it to `index.insert` and discard it. Skipped in
+    /// (de)serialization -- re-sized lazily on first use after `load()`.
+    #[serde(skip)]
+    scratch: Vec<f32>,
 }
 
 pub struct SearchHit {
@@ -135,16 +342,18 @@ impl LatentDb {
             seed.wrapping_add(2),
         );
 
+        let code_len = pq.code_len();
         LatentDb {
             dim,
             projector,
             pq,
             index,
-            records: HashMap::new(),
+            records: RecordArena::new(code_len),
             hash_to_id: HashMap::new(),
             next_id: 0,
             record_budget: 0,
             eviction_policy: EvictionPolicy::OldestFirst,
+            scratch: vec![0.0; sketch_dim],
         }
     }
 
@@ -192,37 +401,37 @@ impl LatentDb {
         let id = self.next_id;
         self.next_id += 1;
 
-        let codes = self.pq.encode(embedding);
-        let projected = self.projector.project(embedding);
-        self.index.insert(id, &projected);
+        let metadata = metadata.into();
 
-        self.records.insert(
-            id,
-            StoredRecord {
-                hash,
-                codes,
-                metadata: metadata.into(),
-            },
-        );
+        if self.scratch.len() != self.projector.out_dim() {
+            self.scratch = vec![0.0; self.projector.out_dim()];
+        }
+        self.projector.project_into(embedding, &mut self.scratch);
+        self.index.insert(id, &self.scratch);
+
+        let pq = &self.pq;
+        self.records
+            .insert(id, hash, &metadata, |slot| pq.encode_into(embedding, slot));
+
         self.hash_to_id.insert(hash, id);
         self.enforce_budget();
         Ok(id)
     }
 
     pub fn remove(&mut self, id: u64) {
-        if let Some(rec) = self.records.remove(&id) {
-            self.hash_to_id.remove(&rec.hash);
+        if let Some(hash) = self.records.remove(id) {
+            self.hash_to_id.remove(&hash);
             self.index.remove(id);
         }
     }
 
     /// Reconstruct the (approximate, PQ-decoded) embedding for a record.
     pub fn get_approx_vector(&self, id: u64) -> Option<Vec<f32>> {
-        self.records.get(&id).map(|r| self.pq.decode(&r.codes))
+        self.records.codes(id).map(|codes| self.pq.decode(codes))
     }
 
     pub fn get_metadata(&self, id: u64) -> Option<&str> {
-        self.records.get(&id).map(|r| r.metadata.as_str())
+        self.records.metadata(id)
     }
 
     pub fn len(&self) -> usize {
@@ -253,12 +462,13 @@ impl LatentDb {
         let mut scored: Vec<SearchHit> = candidates
             .into_iter()
             .filter_map(|id| {
-                let rec = self.records.get(&id)?;
-                let score = lut.cosine_score(&rec.codes);
+                let codes = self.records.codes(id)?;
+                let score = lut.cosine_score(codes);
+                let metadata = self.records.metadata(id)?.to_string();
                 Some(SearchHit {
                     id,
                     score,
-                    metadata: rec.metadata.clone(),
+                    metadata,
                 })
             })
             .collect();
@@ -313,11 +523,13 @@ impl LatentDb {
     where
         F: Fn(&[f32]) -> bool,
     {
-        let mut ids: Vec<u64> = self.records.keys().copied().collect();
-        ids.sort_unstable();
-        let records = ids
-            .into_iter()
-            .map(|id| (id, self.pq.decode(&self.records[&id].codes)));
+        // `RecordArena::ids()` already yields ascending order (a side
+        // effect of scanning slots in order), so no separate sort is needed
+        // here the way the old `HashMap`-backed version required.
+        let records = self
+            .records
+            .ids()
+            .map(|id| (id, self.pq.decode(self.records.codes(id).unwrap())));
         manifold::build_viable_graph(records, predicate, k_nearest, edge_midpoint_check)
     }
 
@@ -359,7 +571,7 @@ impl LatentDb {
     /// "uniform/redundant vs. information-dense" framing katgpt-rs's
     /// `SpectralLOD` docs describe, just measured over vectors and their
     /// centroids instead of token-ID variance within a span.
-    fn energy(&self, id: u64, rec: &StoredRecord) -> f32 {
+    fn energy(&self, id: u64) -> f32 {
         let centroid = self
             .index
             .assigned_centroid(id)
@@ -367,7 +579,10 @@ impl LatentDb {
         let Some(centroid) = centroid else {
             return f32::MAX; // not indexed (shouldn't happen) -- never evict first
         };
-        let approx = self.pq.decode(&rec.codes);
+        let Some(codes) = self.records.codes(id) else {
+            return f32::MAX; // not stored (shouldn't happen) -- never evict first
+        };
+        let approx = self.pq.decode(codes);
         let projected = self.projector.project(&approx);
         projected
             .iter()
@@ -386,15 +601,23 @@ impl LatentDb {
             return;
         }
 
-        let mut ids: Vec<u64> = self.records.keys().copied().collect();
+        let mut ids: Vec<u64> = self.records.ids().collect();
         match self.eviction_policy {
-            EvictionPolicy::OldestFirst => ids.sort_unstable(),
+            // `RecordArena::ids()` already yields ascending (oldest-first)
+            // order, so there's nothing left to do here -- kept as an
+            // explicit arm (rather than folding this into an `if`) so the
+            // compiler still flags this match as non-exhaustive if a third
+            // `EvictionPolicy` variant is ever added.
+            EvictionPolicy::OldestFirst => {}
             EvictionPolicy::LowestEnergy => {
-                ids.sort_by(|&a, &b| {
-                    let ea = self.energy(a, &self.records[&a]);
-                    let eb = self.energy(b, &self.records[&b]);
-                    ea.total_cmp(&eb)
-                });
+                // Precompute every candidate's energy once -- O(n) energy
+                // evaluations -- then sort the precomputed list, instead of
+                // recomputing `energy()` (a decode + project) inside the
+                // sort comparator, which would evaluate it O(n log n) times.
+                let mut scored: Vec<(u64, f32)> =
+                    ids.iter().map(|&id| (id, self.energy(id))).collect();
+                scored.sort_by(|a, b| a.1.total_cmp(&b.1));
+                ids = scored.into_iter().map(|(id, _)| id).collect();
             }
         }
 
@@ -403,26 +626,31 @@ impl LatentDb {
         }
     }
 
-    fn record_leaf_bytes(id: u64, rec: &StoredRecord) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(16 + rec.codes.len() + rec.metadata.len());
+    fn record_leaf_bytes(id: u64, hash: u64, codes: &[u8], metadata: &str) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(16 + codes.len() + metadata.len());
         bytes.extend_from_slice(&id.to_le_bytes());
-        bytes.extend_from_slice(&rec.hash.to_le_bytes());
-        bytes.extend_from_slice(&rec.codes);
-        bytes.extend_from_slice(rec.metadata.as_bytes());
+        bytes.extend_from_slice(&hash.to_le_bytes());
+        bytes.extend_from_slice(codes);
+        bytes.extend_from_slice(metadata.as_bytes());
         bytes
     }
 
     /// Ids in ascending order paired with their Merkle leaf hash -- the
-    /// canonical, deterministic leaf ordering. A `HashMap`'s own iteration
-    /// order isn't stable across runs, so `merkle_root()` would otherwise
-    /// change on every reload even with identical records.
+    /// canonical, deterministic leaf ordering. `RecordArena::ids()` already
+    /// yields ascending order (arena slots are scanned in order), so this
+    /// stays stable across reloads the same way the old explicit sort over
+    /// a `HashMap`'s keys did.
     fn merkle_leaves(&self) -> Vec<(u64, Digest)> {
-        let mut ids: Vec<u64> = self.records.keys().copied().collect();
-        ids.sort_unstable();
-        ids.into_iter()
+        self.records
+            .ids()
             .map(|id| {
-                let rec = &self.records[&id];
-                (id, merkle::hash_leaf(&Self::record_leaf_bytes(id, rec)))
+                let hash = self.records.hash(id).unwrap();
+                let codes = self.records.codes(id).unwrap();
+                let metadata = self.records.metadata(id).unwrap();
+                (
+                    id,
+                    merkle::hash_leaf(&Self::record_leaf_bytes(id, hash, codes, metadata)),
+                )
             })
             .collect()
     }
@@ -470,7 +698,20 @@ impl LatentDb {
         let mut f = File::open(path).map_err(LatentDbError::Io)?;
         let mut bytes = Vec::new();
         f.read_to_end(&mut bytes).map_err(LatentDbError::Io)?;
-        bincode::deserialize(&bytes).map_err(|e| LatentDbError::Serialize(e.to_string()))
+        let db: LatentDb =
+            bincode::deserialize(&bytes).map_err(|e| LatentDbError::Serialize(e.to_string()))?;
+        db.validate_after_deserialize()?;
+        Ok(db)
+    }
+
+    /// Check `records`'s cross-field invariants (see
+    /// `RecordArena::validate`'s doc comment). Every deserialization entry
+    /// point -- `load` above, and `wasm::WasmLatentDb::from_bytes`, which
+    /// deserializes independently since `std::fs` (and therefore `load`)
+    /// has no real backing on `wasm32-unknown-unknown` -- must call this
+    /// before treating a freshly-deserialized `LatentDb` as trustworthy.
+    pub(crate) fn validate_after_deserialize(&self) -> Result<(), LatentDbError> {
+        self.records.validate().map_err(LatentDbError::Serialize)
     }
 }
 
@@ -576,6 +817,64 @@ mod tests {
         let loaded = LatentDb::load(&tmp).unwrap();
         assert_eq!(loaded.len(), db.len());
         assert_eq!(loaded.get_metadata(0), db.get_metadata(0));
+        std::fs::remove_file(tmp).ok();
+    }
+
+    #[test]
+    fn record_arena_validate_accepts_a_freshly_built_arena() {
+        let mut arena = RecordArena::new(2);
+        arena.insert(0, 42, "hello", |slot| slot.copy_from_slice(&[1, 2]));
+        arena.insert(1, 7, "world", |slot| slot.copy_from_slice(&[3, 4]));
+        assert!(arena.validate().is_ok());
+    }
+
+    #[test]
+    fn record_arena_validate_rejects_an_out_of_bounds_metadata_span() {
+        let mut arena = RecordArena::new(2);
+        arena.insert(0, 42, "hello", |slot| slot.copy_from_slice(&[1, 2]));
+        arena.meta_span[0] = (0, 9999);
+        assert!(arena.validate().is_err());
+    }
+
+    #[test]
+    fn record_arena_validate_rejects_invalid_utf8_metadata() {
+        let mut arena = RecordArena::new(2);
+        arena.insert(0, 42, "hello", |slot| slot.copy_from_slice(&[1, 2]));
+        let (offset, len) = arena.meta_span[0];
+        let start = offset as usize;
+        // Same length as the original "hello" span, but not valid UTF-8.
+        for b in &mut arena.meta_bytes[start..start + len as usize] {
+            *b = 0xFF;
+        }
+        assert!(arena.validate().is_err());
+    }
+
+    /// The invariant `validate` checks used to be enforced for free by
+    /// bincode's own `String` deserialization (the old per-record
+    /// `HashMap<u64, StoredRecord>` storage this arena replaced would fail
+    /// `load()` with a `Result::Err` on corrupted metadata bytes, since a
+    /// `String` field can't deserialize invalid UTF-8 at all). This proves
+    /// `load()` still fails the same way -- at the deserialization
+    /// boundary, not later with a panic inside `search()`/`merkle_leaves()`
+    /// -- now that metadata lives in a raw `Vec<u8>` arena buffer bincode
+    /// itself doesn't validate.
+    #[test]
+    fn load_rejects_a_corrupted_arena_instead_of_deserializing_successfully() {
+        let corpus = synthetic_corpus(20, 16, 500);
+        let mut db = LatentDb::build(&corpus, 2, 8, 4, 8, 501);
+        for v in &corpus {
+            db.insert(v, "x").unwrap();
+        }
+        db.records.meta_span[0] = (0, u32::MAX);
+
+        let tmp = std::env::temp_dir().join("latent-db_corrupt_test.bin");
+        db.save(&tmp).unwrap();
+        let result = LatentDb::load(&tmp);
+        assert!(
+            result.is_err(),
+            "load() should reject a corrupted arena rather than succeeding and \
+             leaving a later, unrelated call to panic"
+        );
         std::fs::remove_file(tmp).ok();
     }
 

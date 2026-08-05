@@ -77,9 +77,20 @@ impl PqCodec {
 
     /// Encode a full-precision vector into PQ codes (one byte per subspace).
     pub fn encode(&self, v: &[f32]) -> Vec<u8> {
+        let mut codes = vec![0u8; self.n_subspaces];
+        self.encode_into(v, &mut codes);
+        codes
+    }
+
+    /// Same as [`Self::encode`], but writes into a caller-provided buffer
+    /// (`out.len() == self.code_len()`) instead of allocating a fresh `Vec`.
+    /// Lets a hot path (e.g. `LatentDb::insert`) encode directly into a
+    /// pre-allocated arena slot instead of paying a heap allocation every
+    /// call just to immediately copy the result somewhere else.
+    pub fn encode_into(&self, v: &[f32], out: &mut [u8]) {
         assert_eq!(v.len(), self.dim, "vector dimension mismatch");
-        let mut codes = Vec::with_capacity(self.n_subspaces);
-        for s in 0..self.n_subspaces {
+        assert_eq!(out.len(), self.n_subspaces, "output buffer size mismatch");
+        for (s, out_byte) in out.iter_mut().enumerate() {
             let sub = &v[s * self.sub_dim..(s + 1) * self.sub_dim];
             let mut best_idx = 0usize;
             let mut best_dist = f32::MAX;
@@ -90,9 +101,8 @@ impl PqCodec {
                     best_idx = c_idx;
                 }
             }
-            codes.push(best_idx as u8);
+            *out_byte = best_idx as u8;
         }
-        codes
     }
 
     /// Reconstruct an approximate vector from PQ codes.
@@ -343,5 +353,34 @@ mod tests {
         let training: Vec<Vec<f32>> = (0..50).map(|i| vec![i as f32; 16]).collect();
         let codec = PqCodec::train(&training, 2, 8, 5, 3);
         codec.build_query_lut(&[0.0; 8]);
+    }
+
+    #[test]
+    fn encode_into_matches_encode() {
+        let training: Vec<Vec<f32>> = (0..100)
+            .map(|i| {
+                vec![
+                    (i as f32).sin(),
+                    (i as f32).cos(),
+                    i as f32 * 0.1,
+                    -(i as f32),
+                ]
+            })
+            .collect();
+        let codec = PqCodec::train(&training, 2, 8, 10, 5);
+        let v = &training[3];
+        let expected = codec.encode(v);
+        let mut out = vec![0u8; codec.code_len()];
+        codec.encode_into(v, &mut out);
+        assert_eq!(expected, out);
+    }
+
+    #[test]
+    #[should_panic(expected = "output buffer size mismatch")]
+    fn encode_into_rejects_wrong_output_length() {
+        let training: Vec<Vec<f32>> = (0..50).map(|i| vec![i as f32; 16]).collect();
+        let codec = PqCodec::train(&training, 2, 8, 5, 3);
+        let mut out = vec![0u8; 1];
+        codec.encode_into(&training[0], &mut out);
     }
 }
