@@ -77,6 +77,12 @@ impl ViableGraph {
         }
     }
 
+    /// `id`'s coordinates in this graph's vector space, or `None` if `id`
+    /// isn't a node.
+    pub fn coords_of(&self, id: u64) -> Option<&[f32]> {
+        self.id_to_node.get(&id).map(|&node| self.node_coords(node))
+    }
+
     fn node_coords(&self, node: u32) -> &[f32] {
         let start = node as usize * self.dim;
         &self.coords[start..start + self.dim]
@@ -330,7 +336,7 @@ fn canonicalize_boundary_classes(labels: &mut [u32]) {
     }
 }
 
-fn euclidean(a: &[f32], b: &[f32]) -> f32 {
+pub(crate) fn euclidean(a: &[f32], b: &[f32]) -> f32 {
     a.iter()
         .zip(b)
         .map(|(x, y)| (x - y) * (x - y))

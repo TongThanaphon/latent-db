@@ -44,6 +44,12 @@
 //!   a BLAKE3-committed, unit-norm direction before searching, biasing
 //!   results toward a concept axis without retraining anything. Inspired by
 //!   katgpt-rs's Latent Field Steering (Plan 309).
+//! - **`trajectory`** -- `path_geometry()` scores a `ViableGraph::geodesic()`
+//!   / `random_walk()` path's length, curvature, and minimum adjacent-step
+//!   cosine similarity; `bifurcation_ratio()` measures how much two such
+//!   paths diverge from a shared start. Ported from katgpt-rs's
+//!   `latent_trajectory_geometry` (arXiv:2606.09287 distillation), which is
+//!   pure geometry over a vector sequence with no game-specific assumptions.
 
 pub mod alloc;
 pub mod db;
@@ -55,6 +61,7 @@ pub mod projector;
 pub mod simd;
 pub mod steering;
 pub mod superpose;
+pub mod trajectory;
 #[cfg(feature = "wasm")]
 pub mod wasm;
 
@@ -66,6 +73,7 @@ pub use pq::{PqCodec, QueryLut};
 pub use projector::Projector;
 pub use steering::{SteeringEnvelope, SteeringError, SteeringVector};
 pub use superpose::{circular_convolve, circular_correlate, cosine_sim, SuperposedSlot};
+pub use trajectory::{bifurcation_ratio, path_geometry, BifurcationResult, PathGeometry};
 
 // Debug-only global allocator (see `alloc` module docs): tracks per-thread
 // allocation count/bytes so `*_alloc_check` tests and benches can assert a
