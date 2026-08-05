@@ -34,8 +34,14 @@
 //!   predicate, then `ViableGraph::geodesic()` / `random_walk()` traverse it
 //!   without ever visiting a record that fails the predicate. Inspired by
 //!   katgpt-rs's Viable Manifold Graph (arXiv:2206.00106 distillation).
-//!   `ViableGraph::boundary_classes()` complements that with a structural
-//!   view of the same graph: a signature-refinement partition of its nodes
+//!   `ViableGraph::weighted_random_walk()` is the same traversal with a
+//!   caller-supplied weight function biasing which neighbor gets sampled
+//!   next (e.g. by cosine similarity to a `steering::SteeringVector`
+//!   direction) instead of `random_walk()`'s uniform draw -- ported from
+//!   katgpt-rs's `manifold_curiosity_walk`, an omission from the earlier
+//!   port rather than a deliberate drop. `ViableGraph::boundary_classes()`
+//!   complements that with a structural view of the same graph: a
+//!   signature-refinement partition of its nodes
 //!   into equivalence classes, so structurally redundant records collapse
 //!   together and structurally distinct ones separate out -- a from-scratch
 //!   reinterpretation of katgpt-rs's bisimulation-refinement idea for a kNN

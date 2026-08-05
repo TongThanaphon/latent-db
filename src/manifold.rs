@@ -180,6 +180,86 @@ impl ViableGraph {
         path.into_iter().map(|n| self.ids[n as usize]).collect()
     }
 
+    /// Weighted random walk of `steps` hops starting at `start`: at each
+    /// step, the next node is drawn from the current node's neighbors with
+    /// probability proportional to `weight_fn(current, candidate).max(0.0)`
+    /// (negative weights are treated as zero probability). If every
+    /// candidate's clamped weight is zero, falls back to a uniform draw over
+    /// the candidates, same as [`Self::random_walk`].
+    ///
+    /// Ported from katgpt-rs's `manifold_curiosity_walk`
+    /// (`viable_manifold_graph.rs`) -- an omission from the earlier
+    /// `geodesic`/`random_walk` port from that same source file, not a
+    /// deliberate drop. [`Self::random_walk`] is unaffected and remains the
+    /// plain uniform-draw method.
+    ///
+    /// Same shape contract as [`Self::random_walk`]: returns a path of
+    /// length `steps + 1` (including `start`), an empty `Vec` if `start`
+    /// isn't a node, and parks at the current node for any remaining steps
+    /// once it has no neighbors. `weight_fn` receives `(current_id,
+    /// candidate_id)`, both already resolved to record ids rather than
+    /// internal node indices.
+    pub fn weighted_random_walk<F>(
+        &self,
+        start: u64,
+        steps: usize,
+        seed: u64,
+        weight_fn: F,
+    ) -> Vec<u64>
+    where
+        F: Fn(u64, u64) -> f32,
+    {
+        let Some(&start_node) = self.id_to_node.get(&start) else {
+            return Vec::new();
+        };
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut path: Vec<u32> = Vec::with_capacity(steps + 1);
+        path.push(start_node);
+        let mut cur = start_node;
+        let mut weights: Vec<f32> = Vec::new();
+        for _ in 0..steps {
+            let neighbors = &self.adjacency[cur as usize];
+            if neighbors.is_empty() {
+                let last = *path.last().unwrap();
+                path.resize(steps + 1, last);
+                break;
+            }
+            let cur_id = self.ids[cur as usize];
+            weights.clear();
+            let mut total = 0.0f32;
+            for &n in neighbors {
+                let w = weight_fn(cur_id, self.ids[n as usize]).max(0.0);
+                weights.push(w);
+                total += w;
+            }
+            cur = if total <= 0.0 {
+                neighbors[rng.gen_range(0..neighbors.len())]
+            } else {
+                let mut r = rng.gen::<f32>() * total;
+                // Fallback if float rounding leaves `r` at exactly 0.0
+                // after the loop below instead of going negative: the
+                // *last positive-weight* candidate, never a zero-weight
+                // one (there's at least one positive weight since
+                // `total > 0.0`, so this can't panic).
+                let mut chosen = neighbors[weights.iter().rposition(|&w| w > 0.0).unwrap()];
+                for (i, &w) in weights.iter().enumerate() {
+                    r -= w;
+                    // Strict `<` (not `<=`): a candidate whose clamped
+                    // weight is exactly 0.0 must never be selectable --
+                    // subtracting 0.0 can't push a non-negative `r` below
+                    // zero, so it's provably unreachable here.
+                    if r < 0.0 {
+                        chosen = neighbors[i];
+                        break;
+                    }
+                }
+                chosen
+            };
+            path.push(cur);
+        }
+        path.into_iter().map(|n| self.ids[n as usize]).collect()
+    }
+
     /// Partition this graph's nodes into `boundary classes`: equivalence
     /// classes under recursive kNN-neighborhood structure.
     ///
@@ -448,6 +528,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::steering::SteeringVector;
+    use crate::superpose::cosine_sim;
 
     /// Two disks (radius 1.5 at (-2,0)/(+2,0)) joined by a thin corridor
     /// (|x|<2 AND |y|<0.4) -- the same toy viable set katgpt-rs's own tests
@@ -620,6 +702,201 @@ mod tests {
     fn random_walk_on_unknown_start_is_empty() {
         let g = build_corridor_graph();
         assert!(g.random_walk(999_999, 5, 1).is_empty());
+    }
+
+    // ── weighted_random_walk ─────────────────────────────────────────────
+
+    /// A hub at the origin of an `n_leaves`-dimensional space, plus one leaf
+    /// per axis (one-hot, unit distance from the hub). Every leaf-leaf pair
+    /// is `sqrt(2)` apart, farther than each leaf's `1.0` distance to the
+    /// hub, so with `k_nearest=1` each leaf's own kNN pass always picks the
+    /// hub (same reasoning as `boundary_classes_separates_a_hub_...` below):
+    /// the hub ends up connected to every leaf, and leaves aren't connected
+    /// to each other. Unlike an evenly-spaced circle of leaves, this
+    /// property holds for any `n_leaves` rather than only up to 5.
+    fn star_graph(n_leaves: usize) -> (ViableGraph, u64, Vec<u64>) {
+        let mut records: Vec<(u64, Vec<f32>)> = vec![(0u64, vec![0.0; n_leaves])];
+        let mut leaf_ids = Vec::with_capacity(n_leaves);
+        for i in 0..n_leaves {
+            let mut v = vec![0.0f32; n_leaves];
+            v[i] = 1.0;
+            let id = (i + 1) as u64;
+            records.push((id, v));
+            leaf_ids.push(id);
+        }
+        let g = build_viable_graph(records.into_iter(), |_| true, 1, false);
+        (g, 0u64, leaf_ids)
+    }
+
+    #[test]
+    fn weighted_random_walk_never_leaves_the_viable_subset() {
+        let records = grid_records(0.25);
+        let g = build_viable_graph(records.iter().cloned(), two_disk_corridor, 4, true);
+        let lookup: HashMap<u64, Vec<f32>> = records.into_iter().collect();
+        let start = *lookup.iter().find(|(_, v)| two_disk_corridor(v)).unwrap().0;
+
+        let walk = g.weighted_random_walk(start, 40, 0xC0FFEE, |_, _| 1.0);
+        assert_eq!(walk.len(), 41);
+        assert_eq!(walk.first(), Some(&start));
+        for id in &walk {
+            assert!(
+                two_disk_corridor(&lookup[id]),
+                "walk visited non-viable id {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn weighted_random_walk_is_deterministic_for_a_fixed_seed() {
+        let g = build_corridor_graph();
+        let start = g.ids[0];
+        let walk_a = g.weighted_random_walk(start, 30, 42, |_, _| 1.0);
+        let walk_b = g.weighted_random_walk(start, 30, 42, |_, _| 1.0);
+        assert_eq!(walk_a, walk_b);
+    }
+
+    #[test]
+    fn weighted_random_walk_parks_at_an_isolated_node() {
+        let records = vec![(7u64, vec![0.0, 0.0])];
+        let g = build_viable_graph(records.into_iter(), |_| true, 4, false);
+        let walk = g.weighted_random_walk(7, 5, 1, |_, _| 1.0);
+        assert_eq!(walk, vec![7, 7, 7, 7, 7, 7]);
+    }
+
+    #[test]
+    fn weighted_random_walk_on_unknown_start_is_empty() {
+        let g = build_corridor_graph();
+        assert!(g.weighted_random_walk(999_999, 5, 1, |_, _| 1.0).is_empty());
+    }
+
+    #[test]
+    fn weighted_random_walk_all_zero_weights_falls_back_to_uniform() {
+        let (g, hub, leaves) = star_graph(4);
+        let walk = g.weighted_random_walk(hub, 1, 7, |_, _| 0.0);
+        assert_eq!(walk.len(), 2);
+        assert!(
+            leaves.contains(&walk[1]),
+            "all-zero weights should still land on a valid neighbor"
+        );
+    }
+
+    #[test]
+    fn weighted_random_walk_negative_weights_are_never_chosen() {
+        let (g, hub, leaves) = star_graph(3);
+        // Adjacency lists are sorted by ascending node index, so hub's
+        // neighbor list here is exactly `leaves` in order -- try avoiding
+        // the *first* and *last* positions in that list, since a naive
+        // fallback-selection bug (e.g. defaulting to the last neighbor)
+        // would only show up when the avoided candidate sits at the edge
+        // the fallback favors.
+        for &avoided in &[leaves[0], leaves[leaves.len() - 1]] {
+            for seed in 0..200u64 {
+                let walk =
+                    g.weighted_random_walk(
+                        hub,
+                        1,
+                        seed,
+                        |_, cand| {
+                            if cand == avoided {
+                                -5.0
+                            } else {
+                                1.0
+                            }
+                        },
+                    );
+                assert_ne!(
+                    walk[1], avoided,
+                    "a candidate with a negative (clamped-to-zero) weight must never be picked \
+                     while other candidates have positive weight"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn weighted_random_walk_with_uniform_weights_matches_random_walk_distribution() {
+        // `random_walk`'s `gen_range(0..len)` and `weighted_random_walk`'s
+        // `gen::<f32>() * total` consume `StdRng` differently, so the same
+        // seed can't produce byte-identical sequences between the two
+        // methods -- instead this compares the two methods' per-leaf visit
+        // *distribution* across many seeds, which is what "same statistical
+        // distribution" (issue #7's sanity/regression criterion) means here.
+        let (g, hub, leaves) = star_graph(5);
+        let trials: u64 = 6000;
+        let mut uniform_counts = vec![0u32; leaves.len()];
+        let mut weighted_counts = vec![0u32; leaves.len()];
+        for seed in 0..trials {
+            let u_leaf = g.random_walk(hub, 1, seed)[1];
+            let w_leaf = g.weighted_random_walk(hub, 1, seed, |_, _| 1.0)[1];
+            uniform_counts[leaves.iter().position(|&l| l == u_leaf).unwrap()] += 1;
+            weighted_counts[leaves.iter().position(|&l| l == w_leaf).unwrap()] += 1;
+        }
+        for i in 0..leaves.len() {
+            let u_rate = uniform_counts[i] as f32 / trials as f32;
+            let w_rate = weighted_counts[i] as f32 / trials as f32;
+            assert!(
+                (u_rate - w_rate).abs() < 0.05,
+                "leaf {i}: uniform-weight distribution should match random_walk's, \
+                 got uniform_rate={u_rate}, weighted_rate={w_rate}"
+            );
+        }
+    }
+
+    #[test]
+    fn weighted_random_walk_biased_toward_a_steering_direction_beats_a_plain_random_walk() {
+        let (g, hub, leaves) = star_graph(5);
+        let target_leaf = leaves[0];
+
+        // A direction mostly (not exclusively) aligned with leaf 0's axis,
+        // so candidate weights come out graded rather than a degenerate
+        // all-or-nothing pick.
+        let raw = [0.7f32, 0.3, 0.1, 0.1, 0.1];
+        let norm = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let direction: Vec<f32> = raw.iter().map(|x| x / norm).collect();
+        let steering = SteeringVector::new(direction, 1.0, 1e-3).unwrap();
+
+        let trials: u64 = 400;
+        let steps: usize = 20;
+        let mut weighted_leaf_visits = 0usize;
+        let mut weighted_leaf_slots = 0usize;
+        let mut uniform_leaf_visits = 0usize;
+        let mut uniform_leaf_slots = 0usize;
+
+        for seed in 0..trials {
+            let w_walk = g.weighted_random_walk(hub, steps, seed, |_, cand| {
+                g.coords_of(cand)
+                    .map(|c| cosine_sim(c, steering.as_slice()))
+                    .unwrap_or(0.0)
+            });
+            let u_walk = g.random_walk(hub, steps, seed);
+
+            for &id in &w_walk {
+                if id == hub {
+                    continue;
+                }
+                weighted_leaf_slots += 1;
+                if id == target_leaf {
+                    weighted_leaf_visits += 1;
+                }
+            }
+            for &id in &u_walk {
+                if id == hub {
+                    continue;
+                }
+                uniform_leaf_slots += 1;
+                if id == target_leaf {
+                    uniform_leaf_visits += 1;
+                }
+            }
+        }
+
+        let weighted_rate = weighted_leaf_visits as f32 / weighted_leaf_slots as f32;
+        let uniform_rate = uniform_leaf_visits as f32 / uniform_leaf_slots as f32;
+        assert!(
+            weighted_rate > uniform_rate + 0.2,
+            "steering-biased walk should favor the steered-toward leaf far more often \
+             than a plain random walk: weighted_rate={weighted_rate}, uniform_rate={uniform_rate}"
+        );
     }
 
     #[test]
