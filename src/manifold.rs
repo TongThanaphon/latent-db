@@ -173,6 +173,161 @@ impl ViableGraph {
         }
         path.into_iter().map(|n| self.ids[n as usize]).collect()
     }
+
+    /// Partition this graph's nodes into `boundary classes`: equivalence
+    /// classes under recursive kNN-neighborhood structure.
+    ///
+    /// A from-scratch reinterpretation of katgpt-rs's bisimulation-refinement
+    /// idea (`crates/katgpt-core/src/bisimulation/refine.rs`,
+    /// signature-based partition refinement over a labeled transition graph)
+    /// for a kNN graph rather than a `(state, op, state')` transition system
+    /// -- `ViableGraph` has no operators between records, so a node's
+    /// "signature" here is just the sorted multiset of its neighbors'
+    /// classes, with no operator-label component. Reimplemented rather than
+    /// ported.
+    ///
+    /// Two nodes end up in the same class when their neighborhoods are
+    /// structurally indistinguishable under this refinement: not merely
+    /// "same literal neighbor id set", but recursively -- the sorted
+    /// multiset of one's neighbors' classes matches the other's exactly
+    /// (same classes, same counts), and that condition is in turn checked
+    /// recursively on the neighbors (so, e.g., two leaves hanging off the
+    /// same hub collapse together even though the hub itself is a distinct
+    /// class). Computed by fixed-point signature refinement (1-WL-style
+    /// color refinement): start every node in one class, then repeatedly
+    /// reclassify each node by the sorted multiset of its neighbors'
+    /// current classes (canonicalizing labels each iteration so the
+    /// fixed-point check can't oscillate on a relabeling) until the
+    /// partition stops changing. Like 1-WL, this is a sound but incomplete
+    /// test: it never merges two nodes that are truly structurally
+    /// distinct, but on some regular substructures (e.g. two non-isomorphic
+    /// neighborhoods that still look alike degree-by-degree at every depth)
+    /// it can under-separate them into one class. Purely additive: doesn't
+    /// read or affect [`Self::geodesic`], [`Self::random_walk`], or
+    /// [`Self::neighbors`].
+    pub fn boundary_classes(&self) -> BoundaryClasses {
+        let n = self.n_nodes();
+        if n == 0 {
+            return BoundaryClasses {
+                id_to_class: HashMap::new(),
+                n_classes: 0,
+            };
+        }
+
+        let mut current_class: Vec<u32> = vec![0; n];
+        let mut new_class: Vec<u32> = vec![0; n];
+        let mut signatures: Vec<Vec<u32>> = vec![Vec::new(); n];
+
+        loop {
+            for (node, sig) in signatures.iter_mut().enumerate() {
+                sig.clear();
+                sig.extend(
+                    self.adjacency[node]
+                        .iter()
+                        .map(|&nbr| current_class[nbr as usize]),
+                );
+                sig.sort_unstable();
+            }
+
+            let mut order: Vec<u32> = (0..n as u32).collect();
+            order.sort_by(|&a, &b| {
+                signatures[a as usize]
+                    .cmp(&signatures[b as usize])
+                    .then(a.cmp(&b))
+            });
+
+            let mut next_class = 0u32;
+            for (pos, &node) in order.iter().enumerate() {
+                if pos > 0 && signatures[node as usize] != signatures[order[pos - 1] as usize] {
+                    next_class += 1;
+                }
+                new_class[node as usize] = next_class;
+            }
+
+            canonicalize_boundary_classes(&mut new_class);
+
+            if new_class == current_class {
+                break;
+            }
+            current_class.copy_from_slice(&new_class);
+        }
+
+        let n_classes = current_class
+            .iter()
+            .copied()
+            .max()
+            .map_or(0, |m| m as usize + 1);
+        let id_to_class = self
+            .ids
+            .iter()
+            .zip(current_class.iter())
+            .map(|(&id, &class)| (id, class))
+            .collect();
+
+        BoundaryClasses {
+            id_to_class,
+            n_classes,
+        }
+    }
+}
+
+/// Class id assigned by [`ViableGraph::boundary_classes`].
+pub type BoundaryClassId = u32;
+
+/// Partition of a [`ViableGraph`]'s nodes into boundary classes, computed by
+/// [`ViableGraph::boundary_classes`].
+#[derive(Debug, Clone)]
+pub struct BoundaryClasses {
+    id_to_class: HashMap<u64, BoundaryClassId>,
+    n_classes: usize,
+}
+
+impl BoundaryClasses {
+    /// Number of distinct classes.
+    pub fn n_classes(&self) -> usize {
+        self.n_classes
+    }
+
+    /// `id`'s class, or `None` if `id` wasn't a node of the graph this
+    /// partition was computed from.
+    pub fn class_of(&self, id: u64) -> Option<BoundaryClassId> {
+        self.id_to_class.get(&id).copied()
+    }
+
+    /// Whether `a` and `b` are both graph nodes and share a class.
+    pub fn same_class(&self, a: u64, b: u64) -> bool {
+        matches!((self.class_of(a), self.class_of(b)), (Some(x), Some(y)) if x == y)
+    }
+
+    /// Ids grouped by class: ascending class id, ascending id within each
+    /// class.
+    pub fn classes(&self) -> Vec<Vec<u64>> {
+        let mut groups: Vec<Vec<u64>> = vec![Vec::new(); self.n_classes];
+        for (&id, &class) in &self.id_to_class {
+            groups[class as usize].push(id);
+        }
+        for group in &mut groups {
+            group.sort_unstable();
+        }
+        groups
+    }
+}
+
+/// Renumber class labels so the class of node 0 becomes class 0, the next
+/// new class encountered walking node index ascending becomes 1, etc. --
+/// makes the label vector invariant under class-id permutation, so
+/// [`ViableGraph::boundary_classes`]'s fixed-point check can tell a stable
+/// partition from one that's merely had its labels shuffled between
+/// iterations (which would otherwise oscillate forever).
+fn canonicalize_boundary_classes(labels: &mut [u32]) {
+    let mut old_to_new: HashMap<u32, u32> = HashMap::new();
+    for &label in labels.iter() {
+        let next = old_to_new.len() as u32;
+        old_to_new.entry(label).or_insert(next);
+    }
+    for label in labels.iter_mut() {
+        *label = old_to_new[label];
+    }
 }
 
 fn euclidean(a: &[f32], b: &[f32]) -> f32 {
@@ -459,5 +614,104 @@ mod tests {
     fn random_walk_on_unknown_start_is_empty() {
         let g = build_corridor_graph();
         assert!(g.random_walk(999_999, 5, 1).is_empty());
+    }
+
+    #[test]
+    fn boundary_classes_separates_a_hub_from_its_symmetric_leaves() {
+        // hub(1) at the origin, two leaves (0, 2) equidistant on either
+        // side -- colinear, so each leaf's own nearest-neighbor pass picks
+        // the hub (dist 1) over the other leaf (dist 2), and the hub ends
+        // up wired to both leaves regardless of which single leaf its own
+        // pass happens to pick (edges are added unconditionally from
+        // whichever side's pass selects them).
+        let records = vec![
+            (0u64, vec![-1.0, 0.0]),
+            (1u64, vec![0.0, 0.0]),
+            (2u64, vec![1.0, 0.0]),
+        ];
+        let g = build_viable_graph(records.into_iter(), |_| true, 1, false);
+        assert_eq!(g.neighbors(1).len(), 2, "hub should connect to both leaves");
+
+        let classes = g.boundary_classes();
+        assert_eq!(classes.n_classes(), 2);
+        assert!(
+            classes.same_class(0, 2),
+            "the two leaves have identical neighbor sets ({{hub}}) and must collapse"
+        );
+        assert!(
+            !classes.same_class(0, 1),
+            "the hub has a structurally distinct neighborhood (degree 2 vs 1)"
+        );
+    }
+
+    #[test]
+    fn boundary_classes_collapse_across_isomorphic_but_disconnected_stars() {
+        // Two copies of the same hub-and-leaves shape, far enough apart
+        // that each node's nearest neighbor stays inside its own copy. A
+        // naive "same literal neighbor id set" partitioning would leave
+        // every node in its own singleton class here -- no two nodes share
+        // a neighbor id across components -- so this exercises the
+        // fixed-point refinement recognizing that group A's hub and group
+        // B's hub play the same structural role despite sharing no
+        // neighbors at all.
+        let records = vec![
+            (10u64, vec![-1.0, 0.0]),
+            (11u64, vec![0.0, 0.0]),
+            (12u64, vec![1.0, 0.0]),
+            (20u64, vec![999.0, 0.0]),
+            (21u64, vec![1000.0, 0.0]),
+            (22u64, vec![1001.0, 0.0]),
+        ];
+        let g = build_viable_graph(records.into_iter(), |_| true, 1, false);
+
+        let classes = g.boundary_classes();
+        assert_eq!(
+            classes.n_classes(),
+            2,
+            "just {{hub, leaf}} structural roles"
+        );
+        assert!(classes.same_class(11, 21), "hub A ~ hub B");
+        assert!(classes.same_class(10, 20), "leaf A ~ leaf B");
+        assert!(classes.same_class(10, 12), "leaves within A collapse");
+        assert!(classes.same_class(12, 22), "leaves across A/B collapse");
+        assert!(!classes.same_class(11, 10), "hub role != leaf role");
+
+        let groups = classes.classes();
+        assert_eq!(groups.len(), 2);
+        let hub_group = groups.iter().find(|group| group.contains(&11)).unwrap();
+        assert_eq!(hub_group, &vec![11, 21]);
+        let leaf_group = groups.iter().find(|group| group.contains(&10)).unwrap();
+        assert_eq!(leaf_group, &vec![10, 12, 20, 22]);
+    }
+
+    #[test]
+    fn boundary_classes_on_empty_graph_has_no_classes() {
+        let g = build_viable_graph(
+            std::iter::empty::<(u64, Vec<f32>)>(),
+            |_: &[f32]| true,
+            4,
+            false,
+        );
+        let classes = g.boundary_classes();
+        assert_eq!(classes.n_classes(), 0);
+        assert_eq!(classes.class_of(0), None);
+        assert!(classes.classes().is_empty());
+    }
+
+    #[test]
+    fn boundary_classes_of_unknown_id_is_none() {
+        let g = build_corridor_graph();
+        assert_eq!(g.boundary_classes().class_of(999_999), None);
+    }
+
+    #[test]
+    fn boundary_classes_is_deterministic() {
+        let g = build_corridor_graph();
+        let a = g.boundary_classes();
+        let b = g.boundary_classes();
+        assert_eq!(a.n_classes(), b.n_classes());
+        for &id in &g.ids {
+            assert_eq!(a.class_of(id), b.class_of(id));
+        }
     }
 }

@@ -34,6 +34,12 @@
 //!   predicate, then `ViableGraph::geodesic()` / `random_walk()` traverse it
 //!   without ever visiting a record that fails the predicate. Inspired by
 //!   katgpt-rs's Viable Manifold Graph (arXiv:2206.00106 distillation).
+//!   `ViableGraph::boundary_classes()` complements that with a structural
+//!   view of the same graph: a signature-refinement partition of its nodes
+//!   into equivalence classes, so structurally redundant records collapse
+//!   together and structurally distinct ones separate out -- a from-scratch
+//!   reinterpretation of katgpt-rs's bisimulation-refinement idea for a kNN
+//!   graph rather than a labeled transition system.
 //! - **`steering`** -- `LatentDb::search_steered()` shifts a query vector by
 //!   a BLAKE3-committed, unit-norm direction before searching, biasing
 //!   results toward a concept axis without retraining anything. Inspired by
@@ -54,7 +60,7 @@ pub mod wasm;
 
 pub use db::{EvictionPolicy, LatentDb, LatentDbError, SearchHit};
 pub use index::CentroidIndex;
-pub use manifold::{build_viable_graph, ViableGraph};
+pub use manifold::{build_viable_graph, BoundaryClassId, BoundaryClasses, ViableGraph};
 pub use merkle::{Digest, MerkleProof, MerkleTree};
 pub use pq::{PqCodec, QueryLut};
 pub use projector::Projector;
