@@ -32,6 +32,10 @@
   .verify-result { font-weight: 600; }
   .verify-result.verified { color: #0a7d2c; }
   .verify-result.unverified { color: #b00020; }
+  .class-group { border: 1px solid #ddd; border-radius: 6px; margin: 0.6rem 0; padding: 0.6rem 0.8rem; border-left: 4px solid var(--class-color, #888); }
+  .class-group h3 { font-size: 0.9rem; margin: 0 0 0.4rem; color: #555; }
+  .class-group ul { margin: 0; }
+  .class-group li { border-color: #eee; }
 </style>
 </head>
 <body>
@@ -42,6 +46,7 @@
   <button class="tab-btn active" data-tab="ingest" type="button">Ingest</button>
   <button class="tab-btn" data-tab="search" type="button">Search</button>
   <button class="tab-btn" data-tab="integrity" type="button">Integrity</button>
+  <button class="tab-btn" data-tab="boundary-classes" type="button">Boundary Classes</button>
 </nav>
 
 <section id="tab-ingest" class="tab-panel active">
@@ -97,10 +102,20 @@
   <p id="verify-status" class="hint"></p>
 </section>
 
+<section id="tab-boundary-classes" class="tab-panel">
+  <p class="hint">Builds a <code>ViableGraph</code> over every currently stored record (predicate:
+    accept all) and partitions it with <code>boundary_classes()</code> -- a <em>structural</em>
+    equivalence over the kNN graph's shape, not a similarity clustering, so records only share a
+    class when their local neighborhoods are indistinguishable, not merely "close". Records
+    grouped alone in a class of one are shown too, so the full partition is visible.</p>
+  <p id="boundary-classes-status" class="hint"></p>
+  <div id="boundary-classes-groups"></div>
+</section>
+
 <script type="module">
-// Generic tab-shell wiring: later tabs (Boundary Classes, Steering, Graph
-// Explorer, Bandit Arena) just add a `.tab-btn[data-tab=...]` +
-// `#tab-<name>.tab-panel` pair -- no changes needed here.
+// Generic tab-shell wiring: later tabs (Steering, Graph Explorer, Bandit
+// Arena) just add a `.tab-btn[data-tab=...]` + `#tab-<name>.tab-panel` pair
+// -- no changes needed here.
 const tabButtons = document.querySelectorAll(".tab-btn");
 const tabPanels = document.querySelectorAll(".tab-panel");
 tabButtons.forEach((btn) => {
@@ -117,10 +132,12 @@ const statusEl = document.getElementById("status");
 // Shared POST-JSON submit flow: disable `button`, show `pendingText` in
 // `messageEl`, fetch `endpoint` with `body`, hand the parsed response to
 // `onSuccess`, and on failure show a readable error -- always re-enabling
-// `button` after. Later tabs (Boundary Classes, Steering, Graph Explorer,
-// Bandit Arena) are expected to follow this same request shape, so they
-// route through this instead of re-pasting the fetch/error/disable
-// boilerplate a third time.
+// `button` after. Later tabs with a form-driven POST (Steering, Graph
+// Explorer) are expected to follow this same request shape, so they route
+// through this instead of re-pasting the fetch/error/disable boilerplate a
+// third time. A tab with no request body and no button to disable (like
+// Boundary Classes' `fetchBoundaryClasses` below) follows `fetchIntegrity`'s
+// plain-GET shape instead.
 async function submitJsonForm({ endpoint, body, button, messageEl, pendingText, onSuccess }) {
   button.disabled = true;
   messageEl.classList.remove("error");
@@ -200,6 +217,19 @@ async function runVerify(key) {
   });
 }
 
+// Builds one `<li>` for a record shown anywhere (Ingest's chunk list,
+// Search's hit lists, Boundary Classes' groups): a `key=` + Verify-button
+// header (wired to `runVerify`) followed by its text. `extraHeaderHtml`
+// slots in extra header content specific to that list -- e.g. Search's
+// score -- between the key and the Verify button.
+function renderRecordRow(key, text, extraHeaderHtml = "") {
+  const li = document.createElement("li");
+  li.innerHTML =
+    `<div class="key">key=${key} ${extraHeaderHtml}<button type="button" class="verify-link">Verify</button></div>${text}`;
+  li.querySelector(".verify-link").addEventListener("click", () => runVerify(key));
+  return li;
+}
+
 verifyForm.addEventListener("submit", async (e) => {
   e.preventDefault();
   const key = verifyKeyInput.value.trim();
@@ -208,6 +238,56 @@ verifyForm.addEventListener("submit", async (e) => {
 });
 
 fetchIntegrity();
+
+// Boundary Classes tab: renders `boundary_classes()`'s partition as one
+// section per class, cycling a fixed palette by `class_id` so adjacent
+// classes are visually distinguishable -- purely cosmetic, the palette
+// carries no semantic meaning of its own. GET, not `submitJsonForm`, same
+// no-request-body/no-button reasoning as `fetchIntegrity`; called once on
+// page load and again after every successful ingest (see the ingest
+// handler below) so a rebuild's new partition is never stale on screen.
+const boundaryClassesStatusEl = document.getElementById("boundary-classes-status");
+const boundaryClassesGroupsEl = document.getElementById("boundary-classes-groups");
+const CLASS_COLORS = [
+  "#4c6ef5", "#f76707", "#2f9e44", "#e64980",
+  "#ae3ec9", "#1098ad", "#f08c00", "#495057",
+];
+
+async function fetchBoundaryClasses() {
+  try {
+    const resp = await fetch("/boundary-classes");
+    if (!resp.ok) throw new Error(await resp.text());
+    const result = await resp.json();
+
+    boundaryClassesGroupsEl.innerHTML = "";
+    let totalRecords = 0;
+    for (const group of result.groups) {
+      totalRecords += group.records.length;
+      const section = document.createElement("div");
+      section.className = "class-group";
+      section.style.setProperty("--class-color", CLASS_COLORS[group.class_id % CLASS_COLORS.length]);
+
+      const heading = document.createElement("h3");
+      const noun = group.records.length === 1 ? "record" : "records";
+      heading.textContent = `Class ${group.class_id} (${group.records.length} ${noun})`;
+      section.appendChild(heading);
+
+      const list = document.createElement("ul");
+      for (const record of group.records) {
+        list.appendChild(renderRecordRow(record.key, record.metadata));
+      }
+      section.appendChild(list);
+      boundaryClassesGroupsEl.appendChild(section);
+    }
+    boundaryClassesStatusEl.classList.remove("error");
+    boundaryClassesStatusEl.textContent = `${result.groups.length} class(es) over ${totalRecords} record(s).`;
+  } catch (err) {
+    boundaryClassesStatusEl.classList.add("error");
+    boundaryClassesStatusEl.textContent = `Error: ${err.message}`;
+  }
+}
+
+fetchBoundaryClasses();
 
 const form = document.getElementById("ingest-form");
 const urlInput = document.getElementById("ingest-url");
@@ -233,13 +313,10 @@ form.addEventListener("submit", async (e) => {
         `${result.total_records} total record(s) now.`;
       statusEl.textContent = `${result.total_records} records loaded.`;
       for (const chunk of result.chunks) {
-        const li = document.createElement("li");
-        li.innerHTML =
-          `<div class="key">key=${chunk.key} <button type="button" class="verify-link">Verify</button></div>${chunk.preview}`;
-        li.querySelector(".verify-link").addEventListener("click", () => runVerify(chunk.key));
-        chunksEl.appendChild(li);
+        chunksEl.appendChild(renderRecordRow(chunk.key, chunk.preview));
       }
       fetchIntegrity();
+      fetchBoundaryClasses();
     },
   });
 });
@@ -254,11 +331,8 @@ const searchBlendedEl = document.getElementById("search-blended-results");
 function renderHits(listEl, hits) {
   listEl.innerHTML = "";
   for (const hit of hits) {
-    const li = document.createElement("li");
-    li.innerHTML =
-      `<div class="key">key=${hit.key} <span class="score">score=${hit.score.toFixed(4)}</span> <button type="button" class="verify-link">Verify</button></div>${hit.metadata}`;
-    li.querySelector(".verify-link").addEventListener("click", () => runVerify(hit.key));
-    listEl.appendChild(li);
+    const scoreHtml = `<span class="score">score=${hit.score.toFixed(4)}</span> `;
+    listEl.appendChild(renderRecordRow(hit.key, hit.metadata, scoreHtml));
   }
 }
 
