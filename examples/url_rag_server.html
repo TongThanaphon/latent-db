@@ -21,6 +21,10 @@
   .key { color: #888; font-size: 0.8rem; }
   .hint { color: #888; font-size: 0.85rem; margin: 0.5rem 0; }
   .error { color: #b00020; }
+  .rankings { display: flex; gap: 1rem; flex-wrap: wrap; }
+  .ranking { flex: 1; min-width: 16rem; }
+  .ranking h3 { font-size: 1rem; margin-bottom: 0.4rem; }
+  .score { color: #888; font-size: 0.8rem; }
 </style>
 </head>
 <body>
@@ -29,6 +33,7 @@
 
 <nav class="tabs">
   <button class="tab-btn active" data-tab="ingest" type="button">Ingest</button>
+  <button class="tab-btn" data-tab="search" type="button">Search</button>
 </nav>
 
 <section id="tab-ingest" class="tab-panel active">
@@ -42,6 +47,28 @@
   </form>
   <p id="ingest-status" class="hint"></p>
   <ul id="ingest-chunks"></ul>
+</section>
+
+<section id="tab-search" class="tab-panel">
+  <p class="hint">Type a free-text query and compare plain vector search against
+    <code>search_blended()</code>, which fuses the same vector ranking with a lexical
+    term-overlap ranking over the query's own words. The two score columns aren't on the same
+    scale (cosine similarity vs. Reciprocal Rank Fusion) -- compare rank order, not the numbers.</p>
+  <form id="search-form">
+    <input id="search-query" type="text" placeholder="sleep exercise diet" />
+    <button id="search-button" type="submit">Search</button>
+  </form>
+  <p id="search-status" class="hint"></p>
+  <div class="rankings">
+    <div class="ranking">
+      <h3>Vector search()</h3>
+      <ul id="search-vector-results"></ul>
+    </div>
+    <div class="ranking">
+      <h3>Blended search_blended()</h3>
+      <ul id="search-blended-results"></ul>
+    </div>
+  </div>
 </section>
 
 <script type="module">
@@ -61,6 +88,39 @@ tabButtons.forEach((btn) => {
 });
 
 const statusEl = document.getElementById("status");
+
+// Shared POST-JSON submit flow: disable `button`, show `pendingText` in
+// `messageEl`, fetch `endpoint` with `body`, hand the parsed response to
+// `onSuccess`, and on failure show a readable error -- always re-enabling
+// `button` after. Later tabs (Integrity, Boundary Classes, Steering, Graph
+// Explorer, Bandit Arena) are expected to follow this same request shape,
+// so they route through this instead of re-pasting the fetch/error/disable
+// boilerplate a third time.
+async function submitJsonForm({ endpoint, body, button, messageEl, pendingText, onSuccess }) {
+  button.disabled = true;
+  messageEl.classList.remove("error");
+  messageEl.textContent = pendingText;
+  try {
+    const resp = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok) {
+      // Error responses are plain text (see `(StatusCode, String)` in the
+      // server), not JSON.
+      const text = await resp.text();
+      throw new Error(text || `request failed with status ${resp.status}`);
+    }
+    onSuccess(await resp.json());
+  } catch (err) {
+    messageEl.classList.add("error");
+    messageEl.textContent = `Error: ${err.message}`;
+  } finally {
+    button.disabled = false;
+  }
+}
+
 const form = document.getElementById("ingest-form");
 const urlInput = document.getElementById("ingest-url");
 const button = document.getElementById("ingest-button");
@@ -72,38 +132,63 @@ form.addEventListener("submit", async (e) => {
   const url = urlInput.value.trim();
   if (!url) return;
 
-  button.disabled = true;
-  ingestStatusEl.classList.remove("error");
-  ingestStatusEl.textContent = "Fetching, extracting, embedding...";
   chunksEl.innerHTML = "";
-  try {
-    const resp = await fetch("/ingest", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url }),
-    });
-    if (!resp.ok) {
-      // Error responses are plain text (see `(StatusCode, String)` in the
-      // server), not JSON.
-      const text = await resp.text();
-      throw new Error(text || `request failed with status ${resp.status}`);
-    }
-    const body = await resp.json();
-    ingestStatusEl.textContent =
-      `${body.chunks_added} chunk(s) processed (${body.net_new_records} net-new), ` +
-      `${body.total_records} total record(s) now.`;
-    statusEl.textContent = `${body.total_records} records loaded.`;
-    for (const chunk of body.chunks) {
-      const li = document.createElement("li");
-      li.innerHTML = `<div class="key">key=${chunk.key}</div>${chunk.preview}`;
-      chunksEl.appendChild(li);
-    }
-  } catch (err) {
-    ingestStatusEl.classList.add("error");
-    ingestStatusEl.textContent = `Error: ${err.message}`;
-  } finally {
-    button.disabled = false;
+  await submitJsonForm({
+    endpoint: "/ingest",
+    body: { url },
+    button,
+    messageEl: ingestStatusEl,
+    pendingText: "Fetching, extracting, embedding...",
+    onSuccess: (result) => {
+      ingestStatusEl.textContent =
+        `${result.chunks_added} chunk(s) processed (${result.net_new_records} net-new), ` +
+        `${result.total_records} total record(s) now.`;
+      statusEl.textContent = `${result.total_records} records loaded.`;
+      for (const chunk of result.chunks) {
+        const li = document.createElement("li");
+        li.innerHTML = `<div class="key">key=${chunk.key}</div>${chunk.preview}`;
+        chunksEl.appendChild(li);
+      }
+    },
+  });
+});
+
+const searchForm = document.getElementById("search-form");
+const searchQueryInput = document.getElementById("search-query");
+const searchButton = document.getElementById("search-button");
+const searchStatusEl = document.getElementById("search-status");
+const searchVectorEl = document.getElementById("search-vector-results");
+const searchBlendedEl = document.getElementById("search-blended-results");
+
+function renderHits(listEl, hits) {
+  listEl.innerHTML = "";
+  for (const hit of hits) {
+    const li = document.createElement("li");
+    li.innerHTML =
+      `<div class="key">key=${hit.key} <span class="score">score=${hit.score.toFixed(4)}</span></div>${hit.metadata}`;
+    listEl.appendChild(li);
   }
+}
+
+searchForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const query = searchQueryInput.value.trim();
+  if (!query) return;
+
+  searchVectorEl.innerHTML = "";
+  searchBlendedEl.innerHTML = "";
+  await submitJsonForm({
+    endpoint: "/search",
+    body: { query },
+    button: searchButton,
+    messageEl: searchStatusEl,
+    pendingText: "Embedding and searching...",
+    onSuccess: (result) => {
+      renderHits(searchVectorEl, result.vector);
+      renderHits(searchBlendedEl, result.blended);
+      searchStatusEl.textContent = `${result.vector.length} vector hit(s), ${result.blended.length} blended hit(s).`;
+    },
+  });
 });
 </script>
 </body>

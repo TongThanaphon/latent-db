@@ -24,6 +24,13 @@
 //! length for MiniLM, embeds each chunk, and adds it into the accumulating
 //! DB.
 //!
+//! The second tab is **Search** (Issue #13): type a free-text query and the
+//! server embeds it, then runs both `LatentDb::search()` and
+//! `LatentDb::search_blended()` (the query's own words, split on
+//! whitespace, as the lexical terms) against the current accumulated DB,
+//! returning both rankings -- keyed by `RecordKey`, not the internal id --
+//! side by side, so a viewer can see blended fusion change the top hit.
+//!
 //! Run with:
 //!     cargo run --release --example url_rag_server
 //!
@@ -43,7 +50,7 @@ use candle_core::Tensor;
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config, DTYPE};
 use hf_hub::HFClientSync;
-use latent_db::{LatentDb, LatentDbError};
+use latent_db::{LatentDb, LatentDbError, SearchHit};
 use scraper::{Html as Document, Selector};
 use serde::{Deserialize, Serialize};
 use tokenizers::{
@@ -743,6 +750,101 @@ fn run_ingest(state: &AppState, url: &str) -> Result<IngestResponse> {
     })
 }
 
+#[derive(Deserialize)]
+struct SearchRequest {
+    query: String,
+}
+
+#[derive(Serialize)]
+struct SearchHitView {
+    key: RecordKey,
+    score: f32,
+    metadata: String,
+}
+
+#[derive(Serialize)]
+struct SearchResponse {
+    /// Plain-vector `LatentDb::search()` ranking.
+    vector: Vec<SearchHitView>,
+    /// `LatentDb::search_blended()` ranking, fusing the same vector
+    /// candidates with a lexical/metadata term-overlap ranking over
+    /// `query`'s own words via Reciprocal Rank Fusion. Its `score` is an
+    /// RRF score, not a cosine similarity -- not comparable against
+    /// `vector`'s scores, only against other `blended` entries.
+    blended: Vec<SearchHitView>,
+}
+
+/// Translates `SearchHit::id` (a `LatentDb`-internal id, invalidated by the
+/// next rebuild) to each hit's stable `RecordKey`, preserving rank order. A
+/// hit whose id isn't in `id_to_key` is dropped rather than panicking, but
+/// that's unreachable on the normal path: every id currently in `db` was
+/// registered in `id_to_key` by the same `Corpus::build_db` call.
+fn hits_to_views(hits: Vec<SearchHit>, id_to_key: &HashMap<u64, RecordKey>) -> Vec<SearchHitView> {
+    hits.into_iter()
+        .filter_map(|hit| {
+            let key = *id_to_key.get(&hit.id)?;
+            Some(SearchHitView {
+                key,
+                score: hit.score,
+                metadata: hit.metadata,
+            })
+        })
+        .collect()
+}
+
+/// How many hits each ranking returns.
+const SEARCH_K: usize = 5;
+
+async fn search_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SearchRequest>,
+) -> Result<Json<SearchResponse>, (StatusCode, String)> {
+    let query = req.query.trim().to_string();
+    if query.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "query must not be empty".to_string(),
+        ));
+    }
+
+    tokio::task::spawn_blocking(move || run_search(&state, &query))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map(Json)
+        // `{e:#}` (not `{e}`/`to_string()`), same as `ingest_handler`, so a
+        // chained anyhow error keeps its full context.
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))
+}
+
+/// Embeds `query`, then runs both rankings against the current db: the
+/// plain-vector `search()` and the lexically blended `search_blended()`
+/// (using `query`'s own words, split on whitespace, as the lexical terms --
+/// `search_blended` lowercases them itself). Locks are taken and released
+/// entirely within this synchronous function, mirroring `run_ingest`.
+fn run_search(state: &AppState, query: &str) -> Result<SearchResponse> {
+    let mut embedder = state.embedder.lock().unwrap();
+    let embedding = embedder
+        .embed(&[query])?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("embedding a single query produced no vector"))?;
+    drop(embedder);
+
+    let terms: Vec<&str> = query.split_whitespace().collect();
+
+    let corpus = state.corpus.lock().unwrap();
+    let nprobe = corpus.db.n_index_centroids();
+    let vector_hits = corpus.db.search(&embedding, SEARCH_K, nprobe);
+    let blended_hits = corpus
+        .db
+        .search_blended(&terms, &embedding, SEARCH_K, nprobe);
+    let vector = hits_to_views(vector_hits, &corpus.id_to_key);
+    let blended = hits_to_views(blended_hits, &corpus.id_to_key);
+    drop(corpus);
+
+    Ok(SearchResponse { vector, blended })
+}
+
 async fn index_handler(State(state): State<Arc<AppState>>) -> Html<String> {
     let total_records = state.corpus.lock().unwrap().db.len();
     Html(render_index_html(total_records))
@@ -778,6 +880,7 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/", get(index_handler))
         .route("/ingest", post(ingest_handler))
+        .route("/search", post(search_handler))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", PORT)).await?;
@@ -951,6 +1054,33 @@ mod tests {
             before,
             "LatentDb::insert's content-hash dedup should keep len() stable"
         );
+    }
+
+    #[test]
+    fn hits_to_views_translates_ids_to_stable_keys_and_preserves_rank_order() {
+        let mut id_to_key = HashMap::new();
+        id_to_key.insert(1u64, RecordKey(100));
+        id_to_key.insert(2u64, RecordKey(200));
+        let hits = vec![
+            SearchHit {
+                id: 2,
+                score: 0.9,
+                metadata: "b".to_string(),
+            },
+            SearchHit {
+                id: 1,
+                score: 0.5,
+                metadata: "a".to_string(),
+            },
+        ];
+
+        let views = hits_to_views(hits, &id_to_key);
+
+        assert_eq!(views.len(), 2);
+        assert_eq!(views[0].key, RecordKey(200));
+        assert_eq!(views[0].score, 0.9);
+        assert_eq!(views[0].metadata, "b");
+        assert_eq!(views[1].key, RecordKey(100));
     }
 
     #[test]
