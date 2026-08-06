@@ -52,6 +52,16 @@ name = "viable_graph_bench"
 path = "benches/viable_graph_bench.rs"
 harness = false
 
+[[bench]]
+name = "projector_bench"
+path = "benches/projector_bench.rs"
+harness = false
+
+[[bench]]
+name = "euclidean_kernel_bench"
+path = "benches/euclidean_kernel_bench.rs"
+harness = false
+
 [dev-dependencies]
 anyhow = "1.0.104"
 axum = "0.8"

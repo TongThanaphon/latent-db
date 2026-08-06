@@ -96,7 +96,7 @@ impl Projector {
         for (o, out_val) in out.iter_mut().enumerate() {
             let row_off = o * self.in_dim;
             let row = &self.matrix[row_off..row_off + self.in_dim];
-            *out_val = row.iter().zip(v.iter()).map(|(m, x)| m * x).sum();
+            *out_val = crate::simd::simd_dot_f32(row, v);
         }
     }
 }

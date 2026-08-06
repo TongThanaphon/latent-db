@@ -27,24 +27,41 @@
 //! katgpt-rs's README or source validates or mirrors.
 
 /// Circular convolution: binds `a` and `b` into one vector of the same size.
+///
+/// Direct definition: `out[i] = Σ_j a[j] * b[(i - j) mod n]`. Computed here
+/// as `out[i] = dot(a, rb2[(n-1-i)..(n-1-i+n)])`, where `rb2` is `b` reversed
+/// and duplicated end-to-end (`reverse(b) ++ reverse(b)`, length `2n`): for
+/// `start = n-1-i`, the congruence `(start + m) ≡ (i - m) (mod n)` holds for
+/// *every* `m` in `0..n` (it reduces to `start ≡ n-1-i (mod n)`, which has no
+/// `m` in it), so one fixed `start` makes `rb2[start+m] = b[(i-m) mod n]` for
+/// the whole window -- exactly the `n` terms the direct sum walks over, laid
+/// out contiguously. One [`crate::simd::simd_dot_f32`] call per output
+/// element instead of `n` individually modular-indexed reads. Algebraically
+/// identical to the direct definition; see
+/// `circular_convolve_matches_direct_modular_definition` below.
 pub fn circular_convolve(a: &[f32], b: &[f32]) -> Vec<f32> {
     assert_eq!(a.len(), b.len(), "bind operands must match in length");
     let n = a.len();
+    let mut rb2: Vec<f32> = Vec::with_capacity(2 * n);
+    rb2.extend(b.iter().rev());
+    rb2.extend(b.iter().rev());
     let mut out = vec![0.0f32; n];
     for (i, out_val) in out.iter_mut().enumerate() {
-        let mut sum = 0.0f32;
-        for (j, &aj) in a.iter().enumerate() {
-            // (i - j) mod n
-            let idx = (i + n - j) % n;
-            sum += aj * b[idx];
-        }
-        *out_val = sum;
+        let start = n - 1 - i;
+        *out_val = crate::simd::simd_dot_f32(a, &rb2[start..start + n]);
     }
     out
 }
 
 /// Circular correlation: approximately inverts a circular convolution.
 /// `unbind(convolve(key, value), key) ~= value` (up to noise).
+///
+/// Direct definition: `out[i] = Σ_j key[j] * bundle[(i + j) mod n]`. Computed
+/// here as `out[i] = dot(key, bundle2[i..i+n])`, where `bundle2` is `bundle`
+/// duplicated end-to-end (`bundle ++ bundle`, length `2n`): for a fixed `i`,
+/// `bundle2[i+m] = bundle[(i+m) mod n]` for every `m` in `0..n`, exactly the
+/// `n` terms the direct sum walks over, laid out contiguously -- same
+/// technique as [`circular_convolve`] above.
 pub fn circular_correlate(key: &[f32], bundle: &[f32]) -> Vec<f32> {
     assert_eq!(
         key.len(),
@@ -52,20 +69,18 @@ pub fn circular_correlate(key: &[f32], bundle: &[f32]) -> Vec<f32> {
         "unbind operands must match in length"
     );
     let n = key.len();
+    let mut bundle2: Vec<f32> = Vec::with_capacity(2 * n);
+    bundle2.extend_from_slice(bundle);
+    bundle2.extend_from_slice(bundle);
     let mut out = vec![0.0f32; n];
     for (i, out_val) in out.iter_mut().enumerate() {
-        let mut sum = 0.0f32;
-        for (j, &keyj) in key.iter().enumerate() {
-            let idx = (i + j) % n;
-            sum += keyj * bundle[idx];
-        }
-        *out_val = sum;
+        *out_val = crate::simd::simd_dot_f32(key, &bundle2[i..i + n]);
     }
     out
 }
 
 fn norm(v: &[f32]) -> f32 {
-    v.iter().map(|x| x * x).sum::<f32>().sqrt()
+    crate::simd::simd_dot_f32(v, v).sqrt()
 }
 
 fn normalize(mut v: Vec<f32>) -> Vec<f32> {
@@ -125,7 +140,12 @@ impl SuperposedSlot {
 /// Cosine similarity, used to score how well an `expand()` matches the
 /// original value (1.0 = perfect, 0.0 = orthogonal/no signal left).
 pub fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
-    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    // `norm` below runs over each operand's *full*, untruncated length --
+    // only the dot product is truncated (see `truncate_to_shorter`'s doc
+    // comment) -- exactly matching the original `.zip()`-based dot product
+    // combined with full-length `norm` calls.
+    let (ta, tb) = crate::simd::truncate_to_shorter(a, b);
+    let dot = crate::simd::simd_dot_f32(ta, tb);
     let denom = norm(a) * norm(b);
     if denom < 1e-9 {
         0.0
@@ -142,6 +162,61 @@ pub fn unit(v: Vec<f32>) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The original direct, modular-index definitions -- kept only in tests
+    /// as a reference to check the SIMD-friendly `circular_convolve` /
+    /// `circular_correlate` restructuring against, across an `n` sweep that
+    /// covers the empty case, `n=1`, small `n`, and both a SIMD-width
+    /// multiple and a non-multiple.
+    fn reference_circular_convolve(a: &[f32], b: &[f32]) -> Vec<f32> {
+        let n = a.len();
+        (0..n)
+            .map(|i| {
+                a.iter()
+                    .enumerate()
+                    .map(|(j, &aj)| aj * b[(i + n - j) % n])
+                    .sum()
+            })
+            .collect()
+    }
+
+    fn reference_circular_correlate(key: &[f32], bundle: &[f32]) -> Vec<f32> {
+        let n = key.len();
+        (0..n)
+            .map(|i| {
+                key.iter()
+                    .enumerate()
+                    .map(|(j, &keyj)| keyj * bundle[(i + j) % n])
+                    .sum()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn circular_convolve_matches_direct_modular_definition() {
+        for n in [0usize, 1, 2, 3, 4, 7, 8, 9, 16, 17] {
+            let a: Vec<f32> = (0..n).map(|i| (i as f32 * 0.37).sin()).collect();
+            let b: Vec<f32> = (0..n).map(|i| (i as f32 * 0.61).cos()).collect();
+            let got = circular_convolve(&a, &b);
+            let want = reference_circular_convolve(&a, &b);
+            for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
+                assert!((g - w).abs() < 1e-3, "n={n} i={i}: got {g}, want {w}");
+            }
+        }
+    }
+
+    #[test]
+    fn circular_correlate_matches_direct_modular_definition() {
+        for n in [0usize, 1, 2, 3, 4, 7, 8, 9, 16, 17] {
+            let key: Vec<f32> = (0..n).map(|i| (i as f32 * 0.19).sin()).collect();
+            let bundle: Vec<f32> = (0..n).map(|i| (i as f32 * 0.83).cos()).collect();
+            let got = circular_correlate(&key, &bundle);
+            let want = reference_circular_correlate(&key, &bundle);
+            for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
+                assert!((g - w).abs() < 1e-3, "n={n} i={i}: got {g}, want {w}");
+            }
+        }
+    }
 
     #[test]
     fn single_pair_recovers_almost_exactly() {

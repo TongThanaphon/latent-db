@@ -1,0 +1,6 @@
+# Scoped to wasm32-unknown-unknown only: `simd128` is a WASM-specific target
+# feature, meaningless (and rejected by rustc) on x86_64/aarch64 native
+# builds, so this must not live under a target-less `[build]` section, which
+# would apply to every target this crate is compiled for.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+simd128"]

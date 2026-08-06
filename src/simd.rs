@@ -12,6 +12,13 @@
 //!   table[row_base[i] + codes[i]]`), used by `pq::QueryLut::score_parts` to
 //!   score a candidate's PQ codes against the LUT without ever decoding them
 //!   back to a full-precision vector.
+//! - [`simd_squared_euclidean_f32`] -- squared Euclidean distance (`Σ_i
+//!   (a[i] - b[i])^2`), added by Issue #11 to accelerate `manifold::euclidean`
+//!   (the O(n^2) kNN pass in `build_viable_graph` and A* edge weights in
+//!   `geodesic`) and, via `Projector::project_into` and
+//!   `superpose::cosine_sim`/`circular_convolve`/`circular_correlate`
+//!   reusing [`simd_dot_f32`] directly, the rest of that ticket's scalar-math
+//!   hot paths.
 //!
 //! This is the same stable-Rust, no-nightly `core::arch` dispatch shape
 //! katgpt-rs's own SIMD kernels use (`katgpt-types::simd`) -- runtime `cpuid`
@@ -20,6 +27,23 @@
 //! independently here (this crate has no dependency on katgpt-rs) so later
 //! math tickets in this batch can share this module rather than each
 //! duplicating their own dispatch.
+
+/// Truncates `a` and `b` to their shared shorter length.
+///
+/// Every kernel below (`debug_assert_eq!`-gated) expects equal-length
+/// operands and turns a mismatch into a debug-mode panic. `manifold::euclidean`
+/// and `superpose::cosine_sim` used to be plain `.zip()` loops, which instead
+/// silently truncate to the shorter operand on a mismatch -- to keep those
+/// two functions' own observable behavior unchanged at their public boundary
+/// (Issue #11's acceptance criterion), this is called at each of their call
+/// sites before handing off to a kernel here. Not exported, and not because
+/// any real caller in this crate passes mismatched lengths today (none do)
+/// -- it exists so a caller that someday does gets the old silent-truncation
+/// answer those two functions always gave, not a new debug panic.
+pub(crate) fn truncate_to_shorter<'a>(a: &'a [f32], b: &'a [f32]) -> (&'a [f32], &'a [f32]) {
+    let len = a.len().min(b.len());
+    (&a[..len], &b[..len])
+}
 
 /// SIMD-accelerated dot product: `Σ a[i] * b[i]`. `a` and `b` must be the
 /// same length; returns `0.0` for empty inputs.
@@ -105,6 +129,46 @@ pub fn simd_lut_row_sum_f32(table: &[f32], row_base: &[u32], codes: &[u8]) -> f3
     }
 }
 
+/// SIMD-accelerated squared Euclidean distance: `Σ (a[i] - b[i])^2`. `a` and
+/// `b` must be the same length; returns `0.0` for empty inputs. Callers that
+/// can't guarantee equal-length inputs should truncate to
+/// `a[..len]`/`b[..len]` (`len = a.len().min(b.len())`) themselves before
+/// calling -- same `len`-clamping contract as [`simd_dot_f32`], for the same
+/// out-of-bounds-read-vs-panic reason documented there.
+#[inline(always)]
+pub fn simd_squared_euclidean_f32(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(
+        a.len(),
+        b.len(),
+        "squared-euclidean operands must match in length"
+    );
+    let len = a.len().min(b.len());
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { neon_squared_euclidean_f32(a, b, len) }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_avx2_fma_available() {
+            unsafe { avx2_squared_euclidean_f32(a, b, len) }
+        } else {
+            scalar_squared_euclidean_f32(a, b, len)
+        }
+    }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        unsafe { wasm32_simd128_squared_euclidean_f32(a, b, len) }
+    }
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    )))]
+    {
+        scalar_squared_euclidean_f32(a, b, len)
+    }
+}
+
 // ── Scalar fallback ──────────────────────────────────────────────────────
 
 #[inline(always)]
@@ -127,6 +191,34 @@ fn scalar_dot_f32(a: &[f32], b: &[f32], len: usize) -> f32 {
     let mut sum = acc.iter().sum::<f32>();
     while i < len {
         sum = a[i].mul_add(b[i], sum);
+        i += 1;
+    }
+    sum
+}
+
+#[inline(always)]
+#[allow(dead_code)]
+fn scalar_squared_euclidean_f32(a: &[f32], b: &[f32], len: usize) -> f32 {
+    // Same 4-accumulator FMA shape as `scalar_dot_f32`, subtract-then-square
+    // instead of multiply.
+    let mut acc = [0.0f32; 4];
+    let chunks = len / 4;
+    let mut i = 0;
+    for _ in 0..chunks {
+        let d0 = a[i] - b[i];
+        acc[0] = d0.mul_add(d0, acc[0]);
+        let d1 = a[i + 1] - b[i + 1];
+        acc[1] = d1.mul_add(d1, acc[1]);
+        let d2 = a[i + 2] - b[i + 2];
+        acc[2] = d2.mul_add(d2, acc[2]);
+        let d3 = a[i + 3] - b[i + 3];
+        acc[3] = d3.mul_add(d3, acc[3]);
+        i += 4;
+    }
+    let mut sum = acc.iter().sum::<f32>();
+    while i < len {
+        let d = a[i] - b[i];
+        sum = d.mul_add(d, sum);
         i += 1;
     }
     sum
@@ -236,6 +328,32 @@ unsafe fn avx2_dot_f32(a: &[f32], b: &[f32], len: usize) -> f32 {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn avx2_squared_euclidean_f32(a: &[f32], b: &[f32], len: usize) -> f32 {
+    use core::arch::x86_64::{_mm256_fmadd_ps, _mm256_loadu_ps, _mm256_setzero_ps, _mm256_sub_ps};
+
+    unsafe {
+        let mut acc = _mm256_setzero_ps();
+        let mut i = 0;
+        let chunks8 = len / 8;
+        for _ in 0..chunks8 {
+            let va = _mm256_loadu_ps(a.as_ptr().add(i));
+            let vb = _mm256_loadu_ps(b.as_ptr().add(i));
+            let diff = _mm256_sub_ps(va, vb);
+            acc = _mm256_fmadd_ps(diff, diff, acc);
+            i += 8;
+        }
+        let mut sum = horizontal_sum_256(acc);
+        while i < len {
+            let d = a[i] - b[i];
+            sum = d.mul_add(d, sum);
+            i += 1;
+        }
+        sum
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn avx2_lut_row_sum_f32(table: &[f32], row_base: &[u32], codes: &[u8]) -> f32 {
     use core::arch::x86_64::{
@@ -286,6 +404,32 @@ unsafe fn neon_dot_f32(a: &[f32], b: &[f32], len: usize) -> f32 {
         let mut sum = vaddvq_f32(acc);
         while i < len {
             sum = a[i].mul_add(b[i], sum);
+            i += 1;
+        }
+        sum
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn neon_squared_euclidean_f32(a: &[f32], b: &[f32], len: usize) -> f32 {
+    use core::arch::aarch64::{vaddvq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32, vsubq_f32};
+
+    unsafe {
+        let mut acc = vdupq_n_f32(0.0);
+        let mut i = 0;
+        let chunks4 = len / 4;
+        for _ in 0..chunks4 {
+            let va = vld1q_f32(a.as_ptr().add(i));
+            let vb = vld1q_f32(b.as_ptr().add(i));
+            let diff = vsubq_f32(va, vb);
+            acc = vfmaq_f32(acc, diff, diff);
+            i += 4;
+        }
+        let mut sum = vaddvq_f32(acc);
+        while i < len {
+            let d = a[i] - b[i];
+            sum = d.mul_add(d, sum);
             i += 1;
         }
         sum
@@ -358,6 +502,37 @@ unsafe fn wasm32_simd128_dot_f32(a: &[f32], b: &[f32], len: usize) -> f32 {
 
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 #[inline]
+unsafe fn wasm32_simd128_squared_euclidean_f32(a: &[f32], b: &[f32], len: usize) -> f32 {
+    use core::arch::wasm32::{
+        f32x4_add, f32x4_extract_lane, f32x4_mul, f32x4_splat, f32x4_sub, v128_load,
+    };
+
+    unsafe {
+        let mut acc = f32x4_splat(0.0);
+        let mut i = 0;
+        let chunks4 = len / 4;
+        for _ in 0..chunks4 {
+            let va = v128_load(a.as_ptr().add(i).cast());
+            let vb = v128_load(b.as_ptr().add(i).cast());
+            let diff = f32x4_sub(va, vb);
+            acc = f32x4_add(acc, f32x4_mul(diff, diff));
+            i += 4;
+        }
+        let mut sum = f32x4_extract_lane::<0>(acc)
+            + f32x4_extract_lane::<1>(acc)
+            + f32x4_extract_lane::<2>(acc)
+            + f32x4_extract_lane::<3>(acc);
+        while i < len {
+            let d = a[i] - b[i];
+            sum = d.mul_add(d, sum);
+            i += 1;
+        }
+        sum
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[inline]
 unsafe fn wasm32_simd128_lut_row_sum_f32(table: &[f32], row_base: &[u32], codes: &[u8]) -> f32 {
     use core::arch::wasm32::{f32x4_add, f32x4_extract_lane, f32x4_splat, v128_load};
 
@@ -405,6 +580,10 @@ mod tests {
             .sum()
     }
 
+    fn reference_squared_euclidean(a: &[f32], b: &[f32]) -> f32 {
+        a.iter().zip(b.iter()).map(|(x, y)| (x - y) * (x - y)).sum()
+    }
+
     /// Runs `f` (either `simd_dot_f32` or the scalar fallback) against
     /// [`reference_dot`] across a length sweep that covers the empty case,
     /// sub-chunk tails, and multiple full SIMD-width chunks.
@@ -442,6 +621,22 @@ mod tests {
         }
     }
 
+    /// Runs `f` (either `simd_squared_euclidean_f32` or the scalar fallback)
+    /// against [`reference_squared_euclidean`] across the same length sweep
+    /// as [`check_dot`].
+    fn check_squared_euclidean(f: impl Fn(&[f32], &[f32]) -> f32) {
+        for len in [0usize, 1, 3, 4, 5, 8, 15, 16, 17, 64, 130] {
+            let a: Vec<f32> = (0..len).map(|i| (i as f32 * 0.7).sin()).collect();
+            let b: Vec<f32> = (0..len).map(|i| (i as f32 * 1.3).cos()).collect();
+            let got = f(&a, &b);
+            let want = reference_squared_euclidean(&a, &b);
+            assert!(
+                (got - want).abs() < 1e-3,
+                "len={len}: got {got}, want {want}"
+            );
+        }
+    }
+
     #[test]
     fn dot_matches_reference_for_various_lengths() {
         check_dot(simd_dot_f32);
@@ -450,6 +645,11 @@ mod tests {
     #[test]
     fn lut_row_sum_matches_reference_for_various_lengths() {
         check_lut_row_sum(simd_lut_row_sum_f32);
+    }
+
+    #[test]
+    fn squared_euclidean_matches_reference_for_various_lengths() {
+        check_squared_euclidean(simd_squared_euclidean_f32);
     }
 
     // The dispatcher only ever exercises one backend per target (NEON on
@@ -466,6 +666,11 @@ mod tests {
     #[test]
     fn scalar_lut_row_sum_matches_reference_for_various_lengths() {
         check_lut_row_sum(scalar_lut_row_sum_f32);
+    }
+
+    #[test]
+    fn scalar_squared_euclidean_matches_reference_for_various_lengths() {
+        check_squared_euclidean(|a, b| scalar_squared_euclidean_f32(a, b, a.len()));
     }
 
     #[test]
@@ -496,6 +701,20 @@ mod tests {
             assert!(
                 (dispatched - scalar).abs() < 1e-3,
                 "n_subspaces={n_subspaces}: dispatched={dispatched}, scalar={scalar}"
+            );
+        }
+    }
+
+    #[test]
+    fn squared_euclidean_dispatch_matches_scalar_fallback() {
+        for len in [0usize, 1, 4, 17, 130] {
+            let a: Vec<f32> = (0..len).map(|i| (i as f32 * 0.11).sin()).collect();
+            let b: Vec<f32> = (0..len).map(|i| (i as f32 * 0.53).cos()).collect();
+            let dispatched = simd_squared_euclidean_f32(&a, &b);
+            let scalar = scalar_squared_euclidean_f32(&a, &b, len);
+            assert!(
+                (dispatched - scalar).abs() < 1e-3,
+                "len={len}: dispatched={dispatched}, scalar={scalar}"
             );
         }
     }

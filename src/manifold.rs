@@ -417,11 +417,8 @@ fn canonicalize_boundary_classes(labels: &mut [u32]) {
 }
 
 pub(crate) fn euclidean(a: &[f32], b: &[f32]) -> f32 {
-    a.iter()
-        .zip(b)
-        .map(|(x, y)| (x - y) * (x - y))
-        .sum::<f32>()
-        .sqrt()
+    let (a, b) = crate::simd::truncate_to_shorter(a, b);
+    crate::simd::simd_squared_euclidean_f32(a, b).sqrt()
 }
 
 /// Total-order `f32` wrapper so `BinaryHeap` can be used as a min-heap by
