@@ -16,9 +16,10 @@
 //! | Viable Manifold Graph     | `manifold::ViableGraph` -- kNN graph over a predicate-filtered record subset, `geodesic()` / `random_walk()` traversal (`build_viable_graph()`) |
 //! | Latent Field Steering     | `steering::SteeringVector` -- frozen direction + strength shifts the query before search (`search_steered()`) |
 //! | Manifold Bandit / LatentTaskTree | `bandit::RegionTree` -- PCA + recursive-k-means region tree over stored records, Thompson-sampled (`sample()`) and reward-updated (`observe()`) (`build_region_tree()`) |
+//! | neuron-db's `recall_blended` | Reciprocal Rank Fusion of a lexical/metadata term-overlap ranking with the vector `search()` ranking (`search_blended()`) -- this crate's first borrowing from neuron-db rather than katgpt-rs |
 
 use std::cell::{Ref, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -185,6 +186,31 @@ impl RecordArena {
             .iter()
             .enumerate()
             .filter_map(|(idx, &live)| live.then_some(idx as u64))
+    }
+
+    /// Rank every currently-live record by how many distinct `query_terms`
+    /// (already lowercased by the caller) appear as an exact,
+    /// whitespace-delimited token in its metadata, descending by that
+    /// overlap count, ties broken by ascending id for a deterministic
+    /// order. Records with zero overlap are dropped -- a lexical ranker has
+    /// nothing to say about a record it found no match in, the same way an
+    /// ANN index has nothing to say about a bucket it never probed.
+    fn lexical_rank(&self, query_terms: &HashSet<String>) -> Vec<(u64, usize)> {
+        let mut scored: Vec<(u64, usize)> = self
+            .ids()
+            .filter_map(|id| {
+                let metadata = self.metadata(id)?;
+                let matched: HashSet<String> = metadata
+                    .split_whitespace()
+                    .map(|w| w.to_lowercase())
+                    .filter(|w| query_terms.contains(w))
+                    .collect();
+                (!matched.is_empty()).then_some((id, matched.len()))
+            })
+            .collect();
+
+        scored.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        scored
     }
 
     /// Cross-field invariant check for an arena that may not have come from
@@ -479,28 +505,125 @@ impl LatentDb {
         self.records.is_empty()
     }
 
+    /// The vector-ranking half of [`Self::search`], factored out so
+    /// `search_blended()` can feed the same ranking's rank *positions* (not
+    /// its raw scores) into Reciprocal Rank Fusion. Returns `(id, score)`
+    /// pairs sorted descending by score, *not* truncated to any `k` --
+    /// truncation and metadata lookup are each caller's own concern.
+    fn vector_ranked_candidates(&self, query: &[f32], nprobe: usize) -> Vec<(u64, f32)> {
+        let projected_query = self.projector.project(query);
+        let candidates = self.index.candidates(&projected_query, nprobe);
+
+        let lut = self.pq.build_query_lut(query);
+        let mut scored: Vec<(u64, f32)> = candidates
+            .into_iter()
+            .filter_map(|id| {
+                let codes = self.records.codes(id)?;
+                Some((id, lut.cosine_score(codes)))
+            })
+            .collect();
+
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        scored
+    }
+
     /// Approximate nearest-neighbour search. `nprobe` controls how many
     /// centroid buckets get scanned (higher = more accurate, slower).
     ///
     /// Candidates are scored via a per-query asymmetric-distance lookup
     /// table (`PqCodec::build_query_lut`): the query's dot product and norm
-    /// against every centroid in every subspace is computed once, then each
-    /// candidate's stored codes are summed against that table
-    /// (`QueryLut::cosine_score`) -- no per-candidate PQ decode, no
-    /// per-candidate allocation.
+    /// against every centroid in every subspace is computed once
+    /// (`vector_ranked_candidates`), then each candidate's stored codes are
+    /// summed against that table (`QueryLut::cosine_score`) -- no
+    /// per-candidate PQ decode, no per-candidate allocation.
     pub fn search(&self, query: &[f32], k: usize, nprobe: usize) -> Vec<SearchHit> {
         if query.len() != self.dim {
             return Vec::new();
         }
-        let projected_query = self.projector.project(query);
-        let candidates = self.index.candidates(&projected_query, nprobe);
-
-        let lut = self.pq.build_query_lut(query);
-        let mut scored: Vec<SearchHit> = candidates
+        let mut scored = self.vector_ranked_candidates(query, nprobe);
+        scored.truncate(k);
+        scored
             .into_iter()
-            .filter_map(|id| {
-                let codes = self.records.codes(id)?;
-                let score = lut.cosine_score(codes);
+            .filter_map(|(id, score)| {
+                let metadata = self.records.metadata(id)?.to_string();
+                Some(SearchHit {
+                    id,
+                    score,
+                    metadata,
+                })
+            })
+            .collect()
+    }
+
+    /// Reciprocal Rank Fusion: fold one ranking's ids, in rank order, into
+    /// `scores` -- a record at rank `r` (1-indexed, i.e. `ranked_ids`'
+    /// position + 1) contributes `1 / (RRF_K + r)`, and a record this
+    /// ranking never mentions contributes nothing. Called once per ranking
+    /// being fused, so a record present in both accumulates both
+    /// contributions.
+    fn accumulate_rrf(scores: &mut HashMap<u64, f32>, ranked_ids: impl Iterator<Item = u64>) {
+        const RRF_K: f32 = 60.0;
+        for (rank, id) in ranked_ids.enumerate() {
+            *scores.entry(id).or_insert(0.0) += 1.0 / (RRF_K + (rank + 1) as f32);
+        }
+    }
+
+    /// Like [`Self::search`], but fuses a lexical/metadata term-overlap
+    /// ranking (`query_terms` against each stored record's `metadata`
+    /// string, see `RecordArena::lexical_rank`) with the vector `search()`
+    /// ranking via Reciprocal Rank Fusion -- the fusion technique
+    /// neuron-db's `recall_blended` implements to combine its own lexical
+    /// and semantic recall paths (this crate's first borrowing from
+    /// neuron-db rather than katgpt-rs; see the module docs).
+    ///
+    /// RRF only needs each ranking's *rank position*, not comparable score
+    /// scales, which is what makes it a clean way to combine two very
+    /// differently-scaled rankings (cosine similarity vs. term overlap
+    /// count) without hand-tuned weighting (`accumulate_rrf`). Fused scores
+    /// are summed across both rankings, sorted descending (ties broken by
+    /// ascending id), and truncated to `k`. The returned `SearchHit::score`
+    /// is this fused RRF score, not a cosine similarity -- comparable only
+    /// against other `search_blended` results, not against `search`'s
+    /// scores.
+    ///
+    /// The vector half is still bounded by `nprobe` (only the probed
+    /// buckets' candidates can contribute a vector rank), but the lexical
+    /// half scans every live record's metadata regardless of `nprobe` --
+    /// mirroring two independent recall paths (bounded ANN vs. full-text)
+    /// being fused, rather than lexical matching being limited to whatever
+    /// the vector index happened to probe.
+    ///
+    /// Degrades to exactly `search(query_embedding, k, nprobe)` (same ids,
+    /// order, and scores) when `query_terms` is empty, since there's then
+    /// nothing for a lexical ranking to contribute.
+    ///
+    /// Returns an empty `Vec` if `query_embedding`'s dimension doesn't match
+    /// `self.dim()`, matching `search`'s own dim-mismatch convention.
+    pub fn search_blended(
+        &self,
+        query_terms: &[&str],
+        query_embedding: &[f32],
+        k: usize,
+        nprobe: usize,
+    ) -> Vec<SearchHit> {
+        if query_embedding.len() != self.dim {
+            return Vec::new();
+        }
+        if query_terms.is_empty() {
+            return self.search(query_embedding, k, nprobe);
+        }
+
+        let query_terms: HashSet<String> = query_terms.iter().map(|t| t.to_lowercase()).collect();
+        let vector_ranked = self.vector_ranked_candidates(query_embedding, nprobe);
+        let lexical_ranked = self.records.lexical_rank(&query_terms);
+
+        let mut fused_scores: HashMap<u64, f32> = HashMap::new();
+        Self::accumulate_rrf(&mut fused_scores, vector_ranked.iter().map(|&(id, _)| id));
+        Self::accumulate_rrf(&mut fused_scores, lexical_ranked.iter().map(|&(id, _)| id));
+
+        let mut fused: Vec<SearchHit> = fused_scores
+            .into_iter()
+            .filter_map(|(id, score)| {
                 let metadata = self.records.metadata(id)?.to_string();
                 Some(SearchHit {
                     id,
@@ -510,9 +633,9 @@ impl LatentDb {
             })
             .collect();
 
-        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
-        scored.truncate(k);
-        scored
+        fused.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap().then(a.id.cmp(&b.id)));
+        fused.truncate(k);
+        fused
     }
 
     /// Like [`Self::search`], but first shifts a copy of `query` by
@@ -1226,6 +1349,104 @@ mod tests {
             "steering the query toward record 0's own direction should raise its score \
              ({steered_score} vs {plain_score})"
         );
+    }
+
+    /// Issue 9 acceptance criterion: a record whose `metadata` unambiguously
+    /// matches the query terms, but whose embedding is equally
+    /// (dis)similar to two far-apart clusters, should rank above plain
+    /// vector search's top hit once lexical and vector rankings are fused.
+    ///
+    /// Two tight clusters sit at opposite constant vectors (-5s and +5s);
+    /// the ambiguous record's embedding alternates +3/-3 so its *raw* dot
+    /// product against an all-(-5) query is exactly zero -- the same "no
+    /// lean toward either cluster" signal a genuinely in-between embedding
+    /// would give a cosine-based ranker (PQ quantization can nudge the
+    /// actual `cosine_score` slightly off zero, but not toward either
+    /// cluster in particular). Only that record's metadata contains the
+    /// query terms.
+    #[test]
+    fn search_blended_ranks_lexically_unambiguous_but_vector_ambiguous_record_above_plain_search() {
+        let dim = 16;
+        let mut corpus = Vec::new();
+        for center in [-5.0f32, 5.0] {
+            for i in 0..8 {
+                let mut v = vec![center; dim];
+                v[1] += i as f32 * 0.001; // tiny jitter so cluster members aren't identical
+                corpus.push(v);
+            }
+        }
+        let ambiguous: Vec<f32> = (0..dim)
+            .map(|i| if i % 2 == 0 { 3.0 } else { -3.0 })
+            .collect();
+        corpus.push(ambiguous);
+
+        let mut db = LatentDb::build(&corpus, 2, 8, 4, 8, 100);
+        let mut ids = Vec::new();
+        for (i, v) in corpus.iter().enumerate() {
+            let metadata = if i == corpus.len() - 1 {
+                "widget catalog".to_string()
+            } else {
+                format!("record-{i}")
+            };
+            ids.push(db.insert(v, metadata).unwrap());
+        }
+        let ambiguous_id = *ids.last().unwrap();
+
+        // Dead-center on cluster A: plain vector search should strongly
+        // prefer pure cluster-A members over the equally-(dis)similar
+        // ambiguous record.
+        let query = vec![-5.0f32; dim];
+        let query_terms = ["widget", "catalog"];
+        let nprobe = db.n_index_centroids();
+
+        let plain = db.search(&query, 5, nprobe);
+        assert_ne!(
+            plain[0].id, ambiguous_id,
+            "plain vector search shouldn't favor the vector-ambiguous record"
+        );
+
+        let blended = db.search_blended(&query_terms, &query, 5, nprobe);
+        assert_eq!(
+            blended[0].id, ambiguous_id,
+            "an unambiguous lexical match should win the fused ranking"
+        );
+    }
+
+    /// Issue 9 acceptance criterion: with no query terms, there's nothing
+    /// for a lexical ranking to contribute, so `search_blended` must
+    /// degrade to exactly `search`'s ids, order, and scores.
+    #[test]
+    fn search_blended_with_no_query_terms_matches_plain_vector_search() {
+        let corpus = synthetic_corpus(120, 16, 200);
+        let mut db = LatentDb::build(&corpus, 2, 8, 4, 8, 201);
+        for v in &corpus {
+            db.insert(v, "x").unwrap();
+        }
+        let query = &corpus[5];
+        let nprobe = db.n_index_centroids();
+
+        let plain = db.search(query, 5, nprobe);
+        let blended = db.search_blended(&[], query, 5, nprobe);
+
+        assert_eq!(plain.len(), blended.len());
+        for (a, b) in plain.iter().zip(blended.iter()) {
+            assert_eq!(a.id, b.id);
+            assert_eq!(a.score, b.score);
+            assert_eq!(a.metadata, b.metadata);
+        }
+    }
+
+    #[test]
+    fn search_blended_rejects_dimension_mismatch() {
+        let corpus = synthetic_corpus(50, 16, 300);
+        let mut db = LatentDb::build(&corpus, 2, 8, 4, 8, 301);
+        for v in &corpus {
+            db.insert(v, "x").unwrap();
+        }
+        let wrong_dim_query = vec![0.0f32; 8];
+        assert!(db
+            .search_blended(&["x"], &wrong_dim_query, 5, db.n_index_centroids())
+            .is_empty());
     }
 
     #[test]

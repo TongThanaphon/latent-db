@@ -65,6 +65,16 @@
 //!   `random_walk`/`weighted_random_walk`'s distance- or predicate-driven
 //!   traversal. Ported from katgpt-rs's `manifold_bandit::LatentTaskTree`
 //!   (arXiv:2606.19750 distillation).
+//!
+//! `LatentDb::search_blended()` is this crate's first borrowing from
+//! **neuron-db** rather than katgpt-rs: it fuses a lexical/metadata
+//! term-overlap ranking with the vector `search()` ranking via Reciprocal
+//! Rank Fusion, the technique neuron-db's `recall_blended` actually
+//! implements to combine its own lexical and semantic recall paths. Unlike
+//! katgpt-rs, neuron-db isn't itself a vector database, so this multi-signal
+//! recall/fusion pattern is its own genuine contribution rather than shared
+//! lineage with the rest of this crate. Purely additive: `search()` and
+//! `search_steered()` are unchanged.
 
 pub mod alloc;
 pub mod bandit;
