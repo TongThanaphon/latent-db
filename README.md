@@ -130,6 +130,42 @@ the exact record queried with as the top hit), reports the PQ compression
 ratio, round-trips through save/load, and shows the superposition slot's
 accuracy degrading as more pairs are packed in.
 
+## CLI & HTTP server
+
+`latentdb-cli` is a thin wrapper around the public `LatentDb` API, gated
+behind the `cli` feature (kept separate from the default build so the
+wasm32 `cdylib` target never has to compile axum/tokio):
+
+```bash
+cargo build --release --features cli --bin latentdb-cli
+BIN=./target/release/latentdb-cli
+
+# build: train a fresh (empty) DB from a JSON array-of-arrays training set
+$BIN build --db my.db --training corpus.json \
+    --n-subspaces 8 --n-pq-centroids 32 --n-index-centroids 16 --sketch-dim 8
+
+# insert: add one embedding + metadata, saving the DB back to disk
+$BIN insert --db my.db --embedding "0.1,-0.2,0.3,..." --metadata "doc-1"
+
+# search: approximate nearest-neighbour search, prints JSON hits
+$BIN search --db my.db --query "0.1,-0.2,0.3,..." --k 5 --nprobe 4
+
+# load / save: introspect a DB file, or copy it elsewhere
+$BIN load --db my.db
+$BIN save --db my.db --out my-backup.db
+
+# bench: run (or list) this repo's benches/ suite
+$BIN bench --list
+$BIN bench --name search_bench
+
+# serve: HTTP surface over a loaded DB -- GET /healthz, POST /search, POST /insert
+$BIN serve --db my.db --port 8080
+```
+
+`--embedding`/`--query` take comma-separated floats (negative values are
+fine — `allow_hyphen_values` is set so `-0.2` isn't mistaken for a flag).
+See `tests/cli.rs` for a full build → insert → search → serve round-trip.
+
 ## Development
 
 This repo ships a pre-commit hook (`.githooks/pre-commit`) that runs
@@ -138,6 +174,14 @@ Enable it once per clone:
 
 ```bash
 git config core.hooksPath .githooks
+```
+
+The hook doesn't pass `--features cli`, so it never touches
+`src/bin/latentdb-cli/`; when changing the CLI, additionally run:
+
+```bash
+cargo clippy --all-targets --features cli -- -D warnings
+cargo test --features cli
 ```
 
 ## Design notes & honest limitations

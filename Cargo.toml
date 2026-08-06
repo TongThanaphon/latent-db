@@ -17,9 +17,21 @@ bincode = "1"
 blake3 = "1"
 wasm-bindgen = { version = "0.2", optional = true }
 serde_json = { version = "1", optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+axum = { version = "0.8", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"], optional = true }
+anyhow = { version = "1.0.104", optional = true }
 
 [features]
 wasm = ["dep:wasm-bindgen", "dep:serde_json"]
+# `latentdb-cli` binary (see src/bin/latentdb-cli/main.rs): kept behind its
+# own feature, distinct from `wasm`, so the wasm32-unknown-unknown cdylib
+# build never has to compile tokio/axum (neither meaningfully supports that
+# target). These are declared again here, separately from the equivalent
+# entries under [dev-dependencies] (which examples/embed_server.rs etc. use
+# unconditionally) because dev-dependencies aren't visible to a `[[bin]]`
+# target -- only to examples/tests/benches.
+cli = ["dep:clap", "dep:axum", "dep:tokio", "dep:anyhow", "dep:serde_json"]
 
 # rand/rand_core pull in getrandom transitively for OS-entropy seeding paths
 # (StdRng::from_entropy(), thread_rng(), ...) that this crate never actually
@@ -34,6 +46,11 @@ getrandom = { version = "0.2", features = ["js"] }
 [[example]]
 name = "demo"
 path = "examples/demo.rs"
+
+[[bin]]
+name = "latentdb-cli"
+path = "src/bin/latentdb-cli/main.rs"
+required-features = ["cli"]
 
 # harness = false: hand-rolled std::time::Instant timers, no criterion dev-dep
 # (matches katgpt-rs's own bench convention -- see benches/support.rs).
@@ -61,6 +78,11 @@ harness = false
 name = "euclidean_kernel_bench"
 path = "benches/euclidean_kernel_bench.rs"
 harness = false
+
+[[test]]
+name = "cli"
+path = "tests/cli.rs"
+required-features = ["cli"]
 
 [dev-dependencies]
 anyhow = "1.0.104"
