@@ -31,6 +31,17 @@
 //! returning both rankings -- keyed by `RecordKey`, not the internal id --
 //! side by side, so a viewer can see blended fusion change the top hit.
 //!
+//! The third tab is **Integrity** (Issue #14): shows the current
+//! `LatentDb::compression_ratio()` and `merkle_root()`, and gives every
+//! record shown anywhere (Ingest's chunk list, Search's hit lists, or typed
+//! directly into the tab's own box) a "Verify" action -- `Corpus::verify`
+//! resolves the `RecordKey` to its current `LatentDb` id, then computes a
+//! fresh `merkle_proof()` and `merkle_root()` from the same `&self` borrow
+//! and checks `MerkleProof::verify()`, returning both the boolean and the
+//! exact root it checked against. So a verification that happens to race a
+//! rebuild (someone else's ingest) still checks -- and reports -- a root
+//! taken *after* that rebuild, never a stale one.
+//!
 //! Run with:
 //!     cargo run --release --example url_rag_server
 //!
@@ -50,7 +61,7 @@ use candle_core::Tensor;
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config, DTYPE};
 use hf_hub::HFClientSync;
-use latent_db::{LatentDb, LatentDbError, SearchHit};
+use latent_db::{Digest, LatentDb, LatentDbError, SearchHit};
 use scraper::{Html as Document, Selector};
 use serde::{Deserialize, Serialize};
 use tokenizers::{
@@ -632,6 +643,36 @@ impl Corpus {
         self.rebuild()?;
         Ok(new_keys)
     }
+
+    /// Resolves `key` to its id in the *current* `db` and checks a freshly
+    /// built inclusion proof against a freshly read `merkle_root()` -- both
+    /// read from the same `&self` borrow, so this is correct even called
+    /// immediately after a rebuild (someone else's ingest) changed both the
+    /// id `key` maps to and the root out from under any snapshot a caller
+    /// might otherwise have cached. Returns the verification result paired
+    /// with the exact root it was checked against, so a caller never has to
+    /// fall back to a separately (and possibly staler) fetched root when
+    /// reporting one. Returns `None` if `key` was never issued -- every
+    /// issued key stays resolvable forever (`records` is append-only and
+    /// every record is reinserted into `key_to_id` on every rebuild).
+    fn verify(&self, key: RecordKey) -> Option<(bool, Digest)> {
+        let id = *self.key_to_id.get(&key)?;
+        let proof = self.db.merkle_proof(id)?;
+        let root = self.db.merkle_root();
+        Some((proof.verify(&root), root))
+    }
+}
+
+// ---------------------------------------------------------------------
+// Integrity (Issue #14): compression ratio, Merkle root, and per-record
+// inclusion-proof verification over the current `Corpus::db`.
+// ---------------------------------------------------------------------
+
+/// Lowercase hex encoding, e.g. for rendering a `Digest` (`[u8; 32]`) in a
+/// JSON response. Kept as a local copy rather than pulling in the `hex`
+/// crate -- same one-liner `latentdb-cli`'s `main.rs` already carries.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 // ---------------------------------------------------------------------
@@ -845,6 +886,60 @@ fn run_search(state: &AppState, query: &str) -> Result<SearchResponse> {
     Ok(SearchResponse { vector, blended })
 }
 
+#[derive(Serialize)]
+struct IntegrityStatus {
+    compression_ratio: f32,
+    /// Lowercase hex encoding of the current `merkle_root()`.
+    merkle_root: String,
+}
+
+/// Reads the current compression ratio and Merkle root -- cheap enough
+/// (arithmetic plus a cached-tree lookup, no model/network I/O) to run
+/// directly on the async handler rather than via `spawn_blocking`, unlike
+/// `ingest_handler`/`search_handler`.
+async fn integrity_handler(State(state): State<Arc<AppState>>) -> Json<IntegrityStatus> {
+    let corpus = state.corpus.lock().unwrap();
+    Json(IntegrityStatus {
+        compression_ratio: corpus.db.compression_ratio(),
+        merkle_root: hex(&corpus.db.merkle_root()),
+    })
+}
+
+#[derive(Deserialize)]
+struct VerifyRequest {
+    key: RecordKey,
+}
+
+#[derive(Serialize)]
+struct VerifyResponse {
+    verified: bool,
+    /// Hex encoding of the exact root `verified` was checked against (see
+    /// `Corpus::verify`) -- returned rather than left for the caller to
+    /// infer from a separately fetched `/integrity` response, so a client
+    /// never has to pair this result with a root that might have gone
+    /// stale between the two requests.
+    merkle_root: String,
+}
+
+/// Same no-`spawn_blocking` reasoning as `integrity_handler`: `Corpus::verify`
+/// is a proof build plus a hash comparison, no model/network I/O.
+async fn integrity_verify_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<VerifyRequest>,
+) -> Result<Json<VerifyResponse>, (StatusCode, String)> {
+    let corpus = state.corpus.lock().unwrap();
+    let (verified, root) = corpus.verify(req.key).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("unknown record key {}", req.key.0),
+        )
+    })?;
+    Ok(Json(VerifyResponse {
+        verified,
+        merkle_root: hex(&root),
+    }))
+}
+
 async fn index_handler(State(state): State<Arc<AppState>>) -> Html<String> {
     let total_records = state.corpus.lock().unwrap().db.len();
     Html(render_index_html(total_records))
@@ -881,6 +976,8 @@ async fn main() -> Result<()> {
         .route("/", get(index_handler))
         .route("/ingest", post(ingest_handler))
         .route("/search", post(search_handler))
+        .route("/integrity", get(integrity_handler))
+        .route("/integrity/verify", post(integrity_verify_handler))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", PORT)).await?;
@@ -1100,5 +1197,81 @@ mod tests {
         corpus.ingest(fresh).expect("ingest should succeed");
 
         assert_eq!(corpus.db.len(), before + 5);
+    }
+
+    #[test]
+    fn hex_encodes_bytes_as_lowercase_hex() {
+        assert_eq!(hex(&[0u8, 255u8, 16u8]), "00ff10");
+        assert_eq!(hex(&[]), "");
+    }
+
+    #[test]
+    fn verify_is_none_for_a_key_that_was_never_issued() {
+        let seed = synthetic_records(5, 16);
+        let corpus = Corpus::seed(seed).expect("seed build should succeed");
+        assert_eq!(corpus.verify(RecordKey(9999)), None);
+    }
+
+    #[test]
+    fn verify_confirms_inclusion_of_every_currently_stored_record_against_the_current_root() {
+        let seed = synthetic_records(8, 16);
+        let corpus = Corpus::seed(seed).expect("seed build should succeed");
+        let root = corpus.db.merkle_root();
+
+        for record in &corpus.records {
+            assert_eq!(
+                corpus.verify(record.key),
+                Some((true, root)),
+                "key {:?} should verify against the current root",
+                record.key
+            );
+        }
+    }
+
+    /// The core correctness requirement from Issue #14's acceptance
+    /// criteria: verifying a record that survives a rebuild (triggered by
+    /// someone else's ingest) must check against the *current* root, not a
+    /// root captured before that rebuild.
+    #[test]
+    fn verify_after_a_rebuild_checks_against_the_current_root_not_a_stale_one() {
+        let seed = synthetic_records(5, 16);
+        let mut corpus = Corpus::seed(seed).expect("seed build should succeed");
+        let key = corpus.records[0].key;
+        let root_before = corpus.db.merkle_root();
+
+        let more = synthetic_records(3, 16)
+            .into_iter()
+            .map(|(v, _)| (v, "new-doc".to_string()))
+            .collect();
+        corpus.ingest(more).expect("ingest should succeed");
+
+        let root_after = corpus.db.merkle_root();
+        assert_ne!(
+            root_before, root_after,
+            "an ingest that adds new records should change the root"
+        );
+        let id_after = *corpus.key_to_id.get(&key).unwrap();
+
+        assert_eq!(
+            corpus.verify(key),
+            Some((true, root_after)),
+            "verifying key {key:?} after a rebuild should still succeed against the current \
+             root, and report that root back rather than one the caller had cached"
+        );
+
+        // A proof built against the pre-rebuild root would not verify
+        // against the post-rebuild root -- confirming `verify` really is
+        // reading the current root, not one it happened to have cached.
+        let proof_after = corpus.db.merkle_proof(id_after).unwrap();
+        assert!(!proof_after.verify(&root_before));
+    }
+
+    #[test]
+    fn verify_is_stable_across_repeated_calls_with_no_mutation_between() {
+        let seed = synthetic_records(6, 16);
+        let corpus = Corpus::seed(seed).expect("seed build should succeed");
+        let key = corpus.records[0].key;
+
+        assert_eq!(corpus.verify(key), corpus.verify(key));
     }
 }

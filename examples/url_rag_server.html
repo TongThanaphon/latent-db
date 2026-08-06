@@ -18,13 +18,20 @@
   button:disabled { opacity: 0.5; cursor: default; }
   ul { list-style: none; padding: 0; }
   li { padding: 0.6rem; border: 1px solid #ddd; border-radius: 6px; margin: 0.4rem 0; }
-  .key { color: #888; font-size: 0.8rem; }
+  .key { color: #888; font-size: 0.8rem; display: flex; align-items: center; gap: 0.5rem; }
+  .verify-link { padding: 0.1rem 0.5rem; font-size: 0.75rem; }
   .hint { color: #888; font-size: 0.85rem; margin: 0.5rem 0; }
   .error { color: #b00020; }
   .rankings { display: flex; gap: 1rem; flex-wrap: wrap; }
   .ranking { flex: 1; min-width: 16rem; }
   .ranking h3 { font-size: 1rem; margin-bottom: 0.4rem; }
   .score { color: #888; font-size: 0.8rem; }
+  .stats { list-style: none; padding: 0; margin: 0 0 1rem; }
+  .stats li { padding: 0.5rem 0; border-bottom: 1px solid #eee; }
+  .stats code { word-break: break-all; }
+  .verify-result { font-weight: 600; }
+  .verify-result.verified { color: #0a7d2c; }
+  .verify-result.unverified { color: #b00020; }
 </style>
 </head>
 <body>
@@ -34,6 +41,7 @@
 <nav class="tabs">
   <button class="tab-btn active" data-tab="ingest" type="button">Ingest</button>
   <button class="tab-btn" data-tab="search" type="button">Search</button>
+  <button class="tab-btn" data-tab="integrity" type="button">Integrity</button>
 </nav>
 
 <section id="tab-ingest" class="tab-panel active">
@@ -71,11 +79,28 @@
   </div>
 </section>
 
+<section id="tab-integrity" class="tab-panel">
+  <p class="hint">The current PQ compression ratio and Merkle root over every stored record,
+    refreshed after each ingest. Click <strong>Verify</strong> next to any record in the Ingest
+    or Search tabs -- or paste a <code>key</code> below -- to fetch a fresh
+    <code>merkle_proof()</code> for it and check it against the current root -- this works even
+    right after another ingest rebuilt the tree, since the proof and the root it's checked
+    against are always read together and the root actually used is what gets shown below.</p>
+  <ul class="stats">
+    <li>Compression ratio: <strong id="integrity-ratio">&hellip;</strong></li>
+    <li>Merkle root: <code id="integrity-root">&hellip;</code></li>
+  </ul>
+  <form id="verify-form">
+    <input id="verify-key" type="number" min="0" step="1" placeholder="record key, e.g. 3" />
+    <button id="verify-button" type="submit">Verify</button>
+  </form>
+  <p id="verify-status" class="hint"></p>
+</section>
+
 <script type="module">
-// Generic tab-shell wiring: later tabs (Search, Integrity, Boundary
-// Classes, Steering, Graph Explorer, Bandit Arena) just add a
-// `.tab-btn[data-tab=...]` + `#tab-<name>.tab-panel` pair -- no changes
-// needed here.
+// Generic tab-shell wiring: later tabs (Boundary Classes, Steering, Graph
+// Explorer, Bandit Arena) just add a `.tab-btn[data-tab=...]` +
+// `#tab-<name>.tab-panel` pair -- no changes needed here.
 const tabButtons = document.querySelectorAll(".tab-btn");
 const tabPanels = document.querySelectorAll(".tab-panel");
 tabButtons.forEach((btn) => {
@@ -92,9 +117,9 @@ const statusEl = document.getElementById("status");
 // Shared POST-JSON submit flow: disable `button`, show `pendingText` in
 // `messageEl`, fetch `endpoint` with `body`, hand the parsed response to
 // `onSuccess`, and on failure show a readable error -- always re-enabling
-// `button` after. Later tabs (Integrity, Boundary Classes, Steering, Graph
-// Explorer, Bandit Arena) are expected to follow this same request shape,
-// so they route through this instead of re-pasting the fetch/error/disable
+// `button` after. Later tabs (Boundary Classes, Steering, Graph Explorer,
+// Bandit Arena) are expected to follow this same request shape, so they
+// route through this instead of re-pasting the fetch/error/disable
 // boilerplate a third time.
 async function submitJsonForm({ endpoint, body, button, messageEl, pendingText, onSuccess }) {
   button.disabled = true;
@@ -121,6 +146,69 @@ async function submitJsonForm({ endpoint, body, button, messageEl, pendingText, 
   }
 }
 
+// Integrity tab elements + the verify flow, wired before Ingest/Search
+// below so their result lists can attach a per-record "Verify" button that
+// reuses this same flow -- Issue #14 wants verification to be something a
+// viewer clicks, not a key they have to copy into a separate box.
+const integrityRatioEl = document.getElementById("integrity-ratio");
+const integrityRootEl = document.getElementById("integrity-root");
+const verifyForm = document.getElementById("verify-form");
+const verifyKeyInput = document.getElementById("verify-key");
+const verifyButton = document.getElementById("verify-button");
+const verifyStatusEl = document.getElementById("verify-status");
+
+// GET, not `submitJsonForm` (no request body, no button to disable) --
+// called once on page load and again after every successful ingest, so the
+// Integrity tab is current the moment a viewer opens it.
+async function fetchIntegrity() {
+  try {
+    const resp = await fetch("/integrity");
+    if (!resp.ok) throw new Error(await resp.text());
+    const result = await resp.json();
+    integrityRatioEl.textContent = `${result.compression_ratio.toFixed(2)}x`;
+    integrityRootEl.textContent = result.merkle_root;
+  } catch (err) {
+    integrityRatioEl.textContent = "error";
+    integrityRootEl.textContent = `Error: ${err.message}`;
+  }
+}
+
+// Verifies `key` and switches to the Integrity tab so the result is visible
+// regardless of whether the click came from this tab's own form or a
+// per-record "Verify" button in Ingest/Search. The message quotes
+// `result.merkle_root` -- the exact root the server checked `key` against
+// (see `VerifyResponse` in the server) -- rather than `integrityRootEl`'s
+// last-fetched value, so it can never show a root that's gone stale
+// relative to what was actually verified.
+async function runVerify(key) {
+  verifyKeyInput.value = key;
+  document.querySelector('.tab-btn[data-tab="integrity"]').click();
+
+  verifyStatusEl.classList.remove("verify-result", "verified", "unverified");
+  await submitJsonForm({
+    endpoint: "/integrity/verify",
+    body: { key },
+    button: verifyButton,
+    messageEl: verifyStatusEl,
+    pendingText: "Building proof and verifying...",
+    onSuccess: (result) => {
+      verifyStatusEl.classList.add("verify-result", result.verified ? "verified" : "unverified");
+      verifyStatusEl.textContent = result.verified
+        ? `Verified: key ${key} is included under Merkle root ${result.merkle_root}.`
+        : `Not verified: key ${key}'s proof did not match Merkle root ${result.merkle_root}.`;
+    },
+  });
+}
+
+verifyForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const key = verifyKeyInput.value.trim();
+  if (key === "") return;
+  await runVerify(Number(key));
+});
+
+fetchIntegrity();
+
 const form = document.getElementById("ingest-form");
 const urlInput = document.getElementById("ingest-url");
 const button = document.getElementById("ingest-button");
@@ -146,9 +234,12 @@ form.addEventListener("submit", async (e) => {
       statusEl.textContent = `${result.total_records} records loaded.`;
       for (const chunk of result.chunks) {
         const li = document.createElement("li");
-        li.innerHTML = `<div class="key">key=${chunk.key}</div>${chunk.preview}`;
+        li.innerHTML =
+          `<div class="key">key=${chunk.key} <button type="button" class="verify-link">Verify</button></div>${chunk.preview}`;
+        li.querySelector(".verify-link").addEventListener("click", () => runVerify(chunk.key));
         chunksEl.appendChild(li);
       }
+      fetchIntegrity();
     },
   });
 });
@@ -165,7 +256,8 @@ function renderHits(listEl, hits) {
   for (const hit of hits) {
     const li = document.createElement("li");
     li.innerHTML =
-      `<div class="key">key=${hit.key} <span class="score">score=${hit.score.toFixed(4)}</span></div>${hit.metadata}`;
+      `<div class="key">key=${hit.key} <span class="score">score=${hit.score.toFixed(4)}</span> <button type="button" class="verify-link">Verify</button></div>${hit.metadata}`;
+    li.querySelector(".verify-link").addEventListener("click", () => runVerify(hit.key));
     listEl.appendChild(li);
   }
 }
