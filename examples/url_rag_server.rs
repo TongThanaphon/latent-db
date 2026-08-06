@@ -51,6 +51,19 @@
 //! Renders every record grouped by its class id, translated from the
 //! `LatentDb`-internal id back to `RecordKey`, same as every other tab.
 //!
+//! The fifth tab is **Steering** (Issue #16): pick two records by key (e.g.
+//! from a prior Search) and a query. The server builds a `SteeringVector`
+//! whose direction is record B's full-precision embedding minus record A's,
+//! unit-normalized (`Corpus::build_steering_vector` -- see that method's doc
+//! comment for why it uses the raw embedding rather than
+//! `get_approx_vector`), then runs `LatentDb::search()` and
+//! `LatentDb::search_steered()` for the same query embedding side by side.
+//! `Corpus::build_steering_vector` is the reusable piece this ticket owns:
+//! Issue #17's Graph Explorer tab calls it directly for its steered-walk
+//! toggle rather than reimplementing the construction. An alpha slider
+//! re-runs both rankings live as it moves, so a viewer can watch
+//! `search_steered()`'s ranking shift toward B's concept as alpha increases.
+//!
 //! Run with:
 //!     cargo run --release --example url_rag_server
 //!
@@ -70,7 +83,9 @@ use candle_core::Tensor;
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config, DTYPE};
 use hf_hub::HFClientSync;
-use latent_db::{BoundaryClassId, Digest, LatentDb, LatentDbError, SearchHit};
+use latent_db::{
+    BoundaryClassId, Digest, LatentDb, LatentDbError, SearchHit, SteeringError, SteeringVector,
+};
 use scraper::{Html as Document, Selector};
 use serde::{Deserialize, Serialize};
 use tokenizers::{
@@ -581,6 +596,21 @@ const BUILD_SEED: u64 = 42;
 /// against a synthetic, network-free corpus.
 const BOUNDARY_K_NEAREST: usize = 4;
 
+/// Numerical floor for the L2 norm of `key_b`'s embedding minus `key_a`'s,
+/// checked before normalizing into a direction in
+/// `Corpus::build_steering_vector` -- guards against dividing by (near)
+/// zero when the two picked records have (near) identical embeddings, which
+/// would otherwise silently produce a direction of NaN/Inf rather than a
+/// clear error.
+const STEERING_MIN_DIRECTION_NORM: f32 = 1e-6;
+/// Passed to `SteeringVector::new`'s `norm_tol`: how far the direction's
+/// normalized L2 norm may drift from 1.0 (float rounding from the
+/// subtract-then-normalize pipeline) before being rejected. Generous
+/// relative to the rounding actually involved, since a rejection here would
+/// surface as a confusing internal error rather than the deliberate
+/// "these two records are too similar" `DegenerateDirection` case above.
+const STEERING_NORM_TOL: f32 = 1e-3;
+
 struct Corpus {
     /// Append-only source of truth: every chunk ever accepted, in the
     /// order it was accepted. Never reordered or truncated, so a
@@ -723,6 +753,96 @@ impl Corpus {
                 (class_id as BoundaryClassId, records)
             })
             .collect()
+    }
+
+    /// Looks up `key`'s full-precision embedding in `records` (append-only,
+    /// so a key issued once stays resolvable forever). A linear scan rather
+    /// than a `HashMap`, matching the demo's other O(n)-at-demo-scale reads
+    /// (e.g. `RecordArena::lexical_rank`) -- adding a `RecordKey ->
+    /// embedding` index isn't worth it at this corpus size, and would be
+    /// another piece of state to keep in sync on every `ingest`.
+    fn raw_embedding(&self, key: RecordKey) -> Option<&[f32]> {
+        self.records
+            .iter()
+            .find(|r| r.key == key)
+            .map(|r| r.embedding.as_slice())
+    }
+
+    /// Builds a `SteeringVector` whose direction is `key_b`'s embedding
+    /// minus `key_a`'s, unit-normalized -- "steer search results from A's
+    /// concept toward B's" (Issue #16). Reads each record's raw,
+    /// full-precision embedding via `raw_embedding` rather than
+    /// `LatentDb::get_approx_vector`'s PQ-decoded approximation: with this
+    /// demo's PQ training budget (`PQ_CENTROIDS` quantization levels
+    /// trained over however many records currently exist), two same-topic
+    /// records can legitimately decode to identical codes, which would
+    /// otherwise hand a viewer a spurious "no direction" error for a
+    /// perfectly reasonable pick.
+    ///
+    /// This is the reusable piece Issue #16 owns: Issue #17's Graph
+    /// Explorer tab calls this same method directly for its steered-walk
+    /// toggle, rather than reimplementing the construction.
+    fn build_steering_vector(
+        &self,
+        key_a: RecordKey,
+        key_b: RecordKey,
+        alpha: f32,
+    ) -> Result<SteeringVector, SteeringBuildError> {
+        let embedding_a = self
+            .raw_embedding(key_a)
+            .ok_or(SteeringBuildError::UnknownKey(key_a))?;
+        let embedding_b = self
+            .raw_embedding(key_b)
+            .ok_or(SteeringBuildError::UnknownKey(key_b))?;
+
+        let mut direction: Vec<f32> = embedding_b
+            .iter()
+            .zip(embedding_a.iter())
+            .map(|(b, a)| b - a)
+            .collect();
+        let norm = direction.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm < STEERING_MIN_DIRECTION_NORM {
+            return Err(SteeringBuildError::DegenerateDirection);
+        }
+        for x in &mut direction {
+            *x /= norm;
+        }
+
+        SteeringVector::new(direction, alpha, STEERING_NORM_TOL)
+            .map_err(SteeringBuildError::Steering)
+    }
+}
+
+/// Failure modes for `Corpus::build_steering_vector`, mapped to distinct
+/// HTTP statuses by `steering_search_handler` (see
+/// `SteeringSearchError::into_response`) rather than collapsed into one
+/// generic 500 -- an unknown key or two near-identical picks are both
+/// ordinary client-facing outcomes in this demo, not internal errors.
+#[derive(Debug)]
+enum SteeringBuildError {
+    /// `key_a` or `key_b` was never issued by this `Corpus` (typo'd, or
+    /// from a session against a different server instance).
+    UnknownKey(RecordKey),
+    /// `key_a` and `key_b` have (near) identical raw embeddings, so
+    /// there's no meaningful direction to normalize between them.
+    DegenerateDirection,
+    /// `SteeringVector::new` itself rejected the (already unit-normalized)
+    /// direction or `alpha` -- reachable only if `alpha` is out of
+    /// `[0.0, 1.0]`, since the direction is normalized just above.
+    Steering(SteeringError),
+}
+
+impl std::fmt::Display for SteeringBuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SteeringBuildError::UnknownKey(key) => write!(f, "unknown record key {}", key.0),
+            SteeringBuildError::DegenerateDirection => write!(
+                f,
+                "the two picked records have (near) identical embeddings -- no direction to \
+                 steer along"
+            ),
+            SteeringBuildError::Steering(e) => write!(f, "{e}"),
+        }
     }
 }
 
@@ -920,19 +1040,26 @@ async fn search_handler(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))
 }
 
+/// Embeds a single `query` string through `state.embedder`, locking and
+/// releasing the embedder entirely within this call -- shared by
+/// `run_search` and `run_steering_search`, the two handlers that each embed
+/// exactly one free-text query before searching.
+fn embed_single_query(state: &AppState, query: &str) -> Result<Vec<f32>> {
+    let mut embedder = state.embedder.lock().unwrap();
+    embedder
+        .embed(&[query])?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("embedding a single query produced no vector"))
+}
+
 /// Embeds `query`, then runs both rankings against the current db: the
 /// plain-vector `search()` and the lexically blended `search_blended()`
 /// (using `query`'s own words, split on whitespace, as the lexical terms --
 /// `search_blended` lowercases them itself). Locks are taken and released
 /// entirely within this synchronous function, mirroring `run_ingest`.
 fn run_search(state: &AppState, query: &str) -> Result<SearchResponse> {
-    let mut embedder = state.embedder.lock().unwrap();
-    let embedding = embedder
-        .embed(&[query])?
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("embedding a single query produced no vector"))?;
-    drop(embedder);
+    let embedding = embed_single_query(state, query)?;
 
     let terms: Vec<&str> = query.split_whitespace().collect();
 
@@ -1049,6 +1176,136 @@ async fn boundary_classes_handler(
     Json(BoundaryClassesResponse { groups })
 }
 
+// ---------------------------------------------------------------------
+// Steering (Issue #16): `Corpus::build_steering_vector` (defined above,
+// alongside `Corpus`, since Issue #17's Graph Explorer tab calls it
+// directly too) plus the HTTP layer comparing plain `search()` against
+// `search_steered()` for the same query.
+// ---------------------------------------------------------------------
+
+/// Wire view of a built `SteeringVector`'s identity -- not its raw
+/// direction floats (no reason to ship those to the browser). `commitment`
+/// hashes `direction` *and* `alpha` together (see `compute_commitment` in
+/// the `steering` module), so it changes on every `alpha` tick even for a
+/// fixed `key_a`/`key_b` pair -- shown so a viewer can see each slider move
+/// really did build a distinct `SteeringVector`, not just relabel the same
+/// one.
+#[derive(Serialize)]
+struct SteeringVectorView {
+    dim: usize,
+    alpha: f32,
+    /// Lowercase hex encoding of `SteeringVector::commitment()`.
+    commitment: String,
+}
+
+/// Builds the wire view of `v`, mirroring `hits_to_views`'s plain-function
+/// (not `From`) conversion style used elsewhere in this file.
+fn steering_vector_view(v: &SteeringVector) -> SteeringVectorView {
+    SteeringVectorView {
+        dim: v.dim(),
+        alpha: v.alpha(),
+        commitment: hex(&v.commitment()),
+    }
+}
+
+#[derive(Deserialize)]
+struct SteeringSearchRequest {
+    key_a: RecordKey,
+    key_b: RecordKey,
+    alpha: f32,
+    query: String,
+}
+
+#[derive(Serialize)]
+struct SteeringSearchResponse {
+    /// The `SteeringVector` built from `key_a` -> `key_b` for this request.
+    steering: SteeringVectorView,
+    /// Plain `LatentDb::search()` ranking over `query`'s embedding,
+    /// unsteered.
+    plain: Vec<SearchHitView>,
+    /// `LatentDb::search_steered()` ranking over the same query embedding,
+    /// steered by `steering`.
+    steered: Vec<SearchHitView>,
+}
+
+/// Everything that can go wrong building+running a steered search, kept
+/// distinct from `anyhow::Error` (unlike `run_ingest`/`run_search`) so
+/// `steering_search_handler` can report an unknown key or a degenerate pick
+/// as a client-facing 4xx rather than collapsing every failure into a 500 --
+/// both are ordinary outcomes of typing a stray key into this tab's inputs.
+enum SteeringSearchError {
+    Embed(anyhow::Error),
+    Build(SteeringBuildError),
+}
+
+impl SteeringSearchError {
+    fn into_response(self) -> (StatusCode, String) {
+        match self {
+            // `{e:#}`, same as `run_ingest`/`run_search`'s own mapping, so a
+            // chained anyhow error keeps its full context.
+            SteeringSearchError::Embed(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+            SteeringSearchError::Build(e @ SteeringBuildError::UnknownKey(_)) => {
+                (StatusCode::NOT_FOUND, e.to_string())
+            }
+            SteeringSearchError::Build(e) => (StatusCode::BAD_REQUEST, e.to_string()),
+        }
+    }
+}
+
+async fn steering_search_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SteeringSearchRequest>,
+) -> Result<Json<SteeringSearchResponse>, (StatusCode, String)> {
+    let query = req.query.trim().to_string();
+    if query.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "query must not be empty".to_string(),
+        ));
+    }
+
+    tokio::task::spawn_blocking(move || {
+        run_steering_search(&state, req.key_a, req.key_b, req.alpha, &query)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map(Json)
+    .map_err(SteeringSearchError::into_response)
+}
+
+/// Embeds `query`, builds a `SteeringVector` from `key_a` -> `key_b` via
+/// `Corpus::build_steering_vector`, then runs both `search()` and
+/// `search_steered()` against it -- locks taken and released entirely
+/// within this synchronous function, mirroring `run_ingest`/`run_search`.
+fn run_steering_search(
+    state: &AppState,
+    key_a: RecordKey,
+    key_b: RecordKey,
+    alpha: f32,
+    query: &str,
+) -> Result<SteeringSearchResponse, SteeringSearchError> {
+    let embedding = embed_single_query(state, query).map_err(SteeringSearchError::Embed)?;
+
+    let corpus = state.corpus.lock().unwrap();
+    let steering = corpus
+        .build_steering_vector(key_a, key_b, alpha)
+        .map_err(SteeringSearchError::Build)?;
+    let nprobe = corpus.db.n_index_centroids();
+    let plain_hits = corpus.db.search(&embedding, SEARCH_K, nprobe);
+    let steered_hits = corpus
+        .db
+        .search_steered(&embedding, SEARCH_K, nprobe, &steering);
+    let plain = hits_to_views(plain_hits, &corpus.id_to_key);
+    let steered = hits_to_views(steered_hits, &corpus.id_to_key);
+    drop(corpus);
+
+    Ok(SteeringSearchResponse {
+        steering: steering_vector_view(&steering),
+        plain,
+        steered,
+    })
+}
+
 async fn index_handler(State(state): State<Arc<AppState>>) -> Html<String> {
     let total_records = state.corpus.lock().unwrap().db.len();
     Html(render_index_html(total_records))
@@ -1088,6 +1345,7 @@ async fn main() -> Result<()> {
         .route("/integrity", get(integrity_handler))
         .route("/integrity/verify", post(integrity_verify_handler))
         .route("/boundary-classes", get(boundary_classes_handler))
+        .route("/steering/search", post(steering_search_handler))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", PORT)).await?;
@@ -1509,6 +1767,145 @@ mod tests {
             class_of(key_a).is_some() && class_of(key_a) == class_of(key_b),
             "the two newly-ingested near-duplicate records should share a boundary class after \
              the ingest-triggered rebuild"
+        );
+    }
+
+    #[test]
+    fn build_steering_vector_points_from_a_toward_b_and_is_unit_norm() {
+        let seed = synthetic_records(10, 16);
+        let corpus = Corpus::seed(seed).expect("seed build should succeed");
+        let key_a = corpus.records[0].key;
+        let key_b = corpus.records[1].key;
+
+        let steering = corpus
+            .build_steering_vector(key_a, key_b, 0.5)
+            .expect("two distinct synthetic records should produce a valid direction");
+
+        assert!(steering.verify(STEERING_NORM_TOL));
+        assert_eq!(steering.alpha(), 0.5);
+
+        // The built direction should point the same way as the raw
+        // (un-normalized) B-minus-A difference -- a positive dot product,
+        // not merely "some unit vector".
+        let raw_diff: Vec<f32> = corpus.records[1]
+            .embedding
+            .iter()
+            .zip(corpus.records[0].embedding.iter())
+            .map(|(b, a)| b - a)
+            .collect();
+        let dot: f32 = steering
+            .as_slice()
+            .iter()
+            .zip(raw_diff.iter())
+            .map(|(s, d)| s * d)
+            .sum();
+        assert!(
+            dot > 0.0,
+            "direction should point from A toward B, not away from it (dot={dot})"
+        );
+    }
+
+    #[test]
+    fn build_steering_vector_rejects_an_unknown_key() {
+        let seed = synthetic_records(5, 16);
+        let corpus = Corpus::seed(seed).expect("seed build should succeed");
+        let key_a = corpus.records[0].key;
+        let bogus = RecordKey(9999);
+
+        let err = corpus
+            .build_steering_vector(key_a, bogus, 0.5)
+            .expect_err("an unissued key should be rejected");
+        assert!(matches!(err, SteeringBuildError::UnknownKey(k) if k == bogus));
+    }
+
+    #[test]
+    fn build_steering_vector_rejects_two_identical_keys() {
+        let seed = synthetic_records(5, 16);
+        let corpus = Corpus::seed(seed).expect("seed build should succeed");
+        let key_a = corpus.records[0].key;
+
+        let err = corpus
+            .build_steering_vector(key_a, key_a, 0.5)
+            .expect_err("the same key on both sides has a zero direction");
+        assert!(matches!(err, SteeringBuildError::DegenerateDirection));
+    }
+
+    /// The core correctness requirement from Issue #16's acceptance
+    /// criteria: steering toward record B's own direction should visibly
+    /// raise B's rank/score relative to plain `search()`, using a
+    /// `SteeringVector` built end-to-end through `Corpus::build_steering_vector`
+    /// rather than constructed by hand -- `src/db.rs`'s own
+    /// `search_steered_toward_a_records_own_direction_raises_its_score`
+    /// already pins this at the `LatentDb` layer; this test pins that this
+    /// demo's own construction (`Corpus::build_steering_vector`, using raw
+    /// embeddings rather than PQ-decoded ones) wires correctly into it.
+    #[test]
+    fn corpus_built_steering_vector_raises_the_target_records_score() {
+        let seed = synthetic_records(30, 16);
+        let corpus = Corpus::seed(seed).expect("seed build should succeed");
+        let key_a = corpus.records[0].key;
+        let key_b = corpus.records[10].key;
+        let id_b = *corpus.key_to_id.get(&key_b).unwrap();
+        let query = corpus.records[0].embedding.clone();
+
+        let baseline = corpus
+            .build_steering_vector(key_a, key_b, 0.0)
+            .expect("build should succeed");
+        let strong = corpus
+            .build_steering_vector(key_a, key_b, 1.0)
+            .expect("build should succeed");
+
+        let nprobe = corpus.db.n_index_centroids();
+        let plain = corpus
+            .db
+            .search_steered(&query, corpus.db.len(), nprobe, &baseline);
+        let steered = corpus
+            .db
+            .search_steered(&query, corpus.db.len(), nprobe, &strong);
+
+        let plain_score = plain.iter().find(|h| h.id == id_b).unwrap().score;
+        let steered_score = steered.iter().find(|h| h.id == id_b).unwrap().score;
+        assert!(
+            steered_score > plain_score,
+            "steering the query from A toward B should raise B's score \
+             ({steered_score} vs {plain_score})"
+        );
+    }
+
+    /// Pins the specific claim the Steering tab's UI makes -- that the
+    /// alpha slider "visibly re-ranks results as it moves" (Issue #16) --
+    /// at the same `SEARCH_K`-truncated width the tab actually renders,
+    /// rather than at `db.len()` like the score-comparison test above.
+    /// Uses a query distinct from both picked records (unlike that test,
+    /// which queries with A's own embedding), closer to how a viewer would
+    /// actually drive this tab: type an unrelated query, then compare.
+    #[test]
+    fn corpus_built_steering_vector_visibly_reranks_the_rendered_top_k() {
+        let seed = synthetic_records(40, 16);
+        let corpus = Corpus::seed(seed).expect("seed build should succeed");
+        let key_a = corpus.records[0].key;
+        let key_b = corpus.records[20].key;
+        let id_b = *corpus.key_to_id.get(&key_b).unwrap();
+        let query = corpus.records[5].embedding.clone();
+
+        let off = corpus
+            .build_steering_vector(key_a, key_b, 0.0)
+            .expect("build should succeed");
+        let strong = corpus
+            .build_steering_vector(key_a, key_b, 1.0)
+            .expect("build should succeed");
+
+        let nprobe = corpus.db.n_index_centroids();
+        let plain_top = corpus.db.search_steered(&query, SEARCH_K, nprobe, &off);
+        let steered_top = corpus.db.search_steered(&query, SEARCH_K, nprobe, &strong);
+
+        let plain_has_b = plain_top.iter().any(|h| h.id == id_b);
+        let steered_has_b = steered_top.iter().any(|h| h.id == id_b);
+        assert!(
+            !plain_has_b && steered_has_b,
+            "steering strongly toward B should bring it into the rendered top-{SEARCH_K} \
+             even though it isn't there in the plain ranking \
+             (plain_has_b={plain_has_b}, steered_has_b={steered_has_b})"
         );
     }
 }

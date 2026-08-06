@@ -47,6 +47,7 @@
   <button class="tab-btn" data-tab="search" type="button">Search</button>
   <button class="tab-btn" data-tab="integrity" type="button">Integrity</button>
   <button class="tab-btn" data-tab="boundary-classes" type="button">Boundary Classes</button>
+  <button class="tab-btn" data-tab="steering" type="button">Steering</button>
 </nav>
 
 <section id="tab-ingest" class="tab-panel active">
@@ -110,6 +111,37 @@
     grouped alone in a class of one are shown too, so the full partition is visible.</p>
   <p id="boundary-classes-status" class="hint"></p>
   <div id="boundary-classes-groups"></div>
+</section>
+
+<section id="tab-steering" class="tab-panel">
+  <p class="hint">Pick two records by key (e.g. from a Search or Boundary Classes result) to
+    define a concept direction -- the server builds a <code>SteeringVector</code> pointing from
+    record A's embedding toward record B's, unit-normalized. Type a query and click Compare, then
+    drag the alpha slider: it re-runs <code>search_steered()</code> live against the same query,
+    so the right-hand column visibly re-ranks toward B's concept as alpha increases, next to
+    plain <code>search()</code> on the left for comparison.</p>
+  <form id="steering-form">
+    <input id="steering-key-a" type="number" min="0" step="1" placeholder="record A key" />
+    <input id="steering-key-b" type="number" min="0" step="1" placeholder="record B key" />
+    <input id="steering-query" type="text" placeholder="sleep exercise diet" />
+    <button id="steering-button" type="submit">Compare</button>
+  </form>
+  <p class="hint">
+    alpha = <strong id="steering-alpha-value">0.50</strong>
+    <input id="steering-alpha" type="range" min="0" max="1" step="0.05" value="0.5" disabled />
+  </p>
+  <p id="steering-status" class="hint"></p>
+  <p id="steering-vector" class="hint"></p>
+  <div class="rankings">
+    <div class="ranking">
+      <h3>Plain search()</h3>
+      <ul id="steering-plain-results"></ul>
+    </div>
+    <div class="ranking">
+      <h3>Steered search_steered()</h3>
+      <ul id="steering-steered-results"></ul>
+    </div>
+  </div>
 </section>
 
 <script type="module">
@@ -355,6 +387,102 @@ searchForm.addEventListener("submit", async (e) => {
       searchStatusEl.textContent = `${result.vector.length} vector hit(s), ${result.blended.length} blended hit(s).`;
     },
   });
+});
+
+// Steering tab (Issue #16): builds a SteeringVector from two picked record
+// keys and re-runs search() vs. search_steered() for the same query as the
+// alpha slider moves. Reuses renderHits/renderRecordRow, same as Search.
+const steeringForm = document.getElementById("steering-form");
+const steeringKeyAInput = document.getElementById("steering-key-a");
+const steeringKeyBInput = document.getElementById("steering-key-b");
+const steeringQueryInput = document.getElementById("steering-query");
+const steeringButton = document.getElementById("steering-button");
+const steeringAlphaInput = document.getElementById("steering-alpha");
+const steeringAlphaValueEl = document.getElementById("steering-alpha-value");
+const steeringStatusEl = document.getElementById("steering-status");
+const steeringVectorEl = document.getElementById("steering-vector");
+const steeringPlainEl = document.getElementById("steering-plain-results");
+const steeringSteeredEl = document.getElementById("steering-steered-results");
+
+// The (key_a, key_b, query) triple from the last successful "Compare" --
+// the alpha slider re-runs against this same triple on every drag, rather
+// than requiring a fresh form submit to feel live. `null` until the first
+// successful Compare, which is also what keeps the (disabled-by-default)
+// slider from firing requests before there's anything to steer between.
+let steeringLastParams = null;
+// Monotonic counter so a response for a superseded alpha (one the user has
+// since dragged past) never overwrites a newer one that happened to
+// resolve first.
+let steeringRequestSeq = 0;
+// Single-flight, trailing-edge in-flight guard: `input` fires once per
+// pixel of drag, and each run re-embeds `query` through a full BERT forward
+// pass, so firing one request per event would queue up a large backlog and
+// make the slider feel frozen rather than live. While a request is
+// in-flight, only the *latest* requested alpha is remembered; it fires the
+// moment the in-flight one finishes, so the UI always converges to
+// wherever the slider currently sits without queuing every intermediate
+// value.
+let steeringInFlight = false;
+let steeringPendingAlpha = null;
+
+async function runSteeringSearch(alpha) {
+  const seq = ++steeringRequestSeq;
+  await submitJsonForm({
+    endpoint: "/steering/search",
+    body: {
+      key_a: steeringLastParams.keyA,
+      key_b: steeringLastParams.keyB,
+      query: steeringLastParams.query,
+      alpha,
+    },
+    button: steeringButton,
+    messageEl: steeringStatusEl,
+    pendingText: "Building steering vector and searching...",
+    onSuccess: (result) => {
+      if (seq !== steeringRequestSeq) return;
+      renderHits(steeringPlainEl, result.plain);
+      renderHits(steeringSteeredEl, result.steered);
+      steeringStatusEl.textContent =
+        `${result.plain.length} plain hit(s), ${result.steered.length} steered hit(s) ` +
+        `at alpha=${alpha.toFixed(2)}.`;
+      steeringVectorEl.textContent =
+        `SteeringVector: dim=${result.steering.dim}, alpha=${result.steering.alpha.toFixed(2)}, ` +
+        `commitment=${result.steering.commitment}`;
+    },
+  });
+}
+
+async function requestSteeringAlpha(alpha) {
+  steeringPendingAlpha = alpha;
+  if (steeringInFlight) return;
+  steeringInFlight = true;
+  while (steeringPendingAlpha !== null) {
+    const next = steeringPendingAlpha;
+    steeringPendingAlpha = null;
+    await runSteeringSearch(next);
+  }
+  steeringInFlight = false;
+}
+
+steeringForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const keyA = steeringKeyAInput.value.trim();
+  const keyB = steeringKeyBInput.value.trim();
+  const query = steeringQueryInput.value.trim();
+  if (keyA === "" || keyB === "" || !query) return;
+
+  steeringLastParams = { keyA: Number(keyA), keyB: Number(keyB), query };
+  steeringAlphaInput.disabled = false;
+  steeringPlainEl.innerHTML = "";
+  steeringSteeredEl.innerHTML = "";
+  await requestSteeringAlpha(Number(steeringAlphaInput.value));
+});
+
+steeringAlphaInput.addEventListener("input", () => {
+  const alpha = Number(steeringAlphaInput.value);
+  steeringAlphaValueEl.textContent = alpha.toFixed(2);
+  if (!steeringLastParams) return;
+  requestSteeringAlpha(alpha);
 });
 </script>
 </body>
