@@ -64,6 +64,23 @@
 //! re-runs both rankings live as it moves, so a viewer can watch
 //! `search_steered()`'s ranking shift toward B's concept as alpha increases.
 //!
+//! The sixth tab is **Graph Explorer** (Issue #17): pick two records A and B
+//! by key and build the same kind of "every currently-stored record"
+//! `ViableGraph` Boundary Classes uses (its own `k_nearest`, see
+//! `GRAPH_K_NEAREST`). **Path** mode shows `geodesic(A, B)` plus
+//! `trajectory::path_geometry()`'s length/curvature/min-adjacent-cosine over
+//! it, and a `bifurcation_ratio()` against a same-length comparison path --
+//! a `random_walk()` anchored at the geodesic's own second node (one real
+//! hop off A) rather than at A itself, since starting both paths at the
+//! identical coordinate would put `bifurcation_ratio` in its zero-initial-
+//! separation edge case (`separation_ratio` pinned to `1.0` or `+inf`,
+//! `onset_step` always `None` -- see that function's doc comment) on every
+//! request rather than only when the two paths genuinely start together.
+//! **Walk** mode instead runs `weighted_random_walk()` from A, biased by a
+//! `SteeringVector` built through `Corpus::build_steering_vector(A, B, ..)` --
+//! the same reusable piece Steering owns, not reimplemented here -- next to
+//! a plain `random_walk()` from the same start for comparison.
+//!
 //! Run with:
 //!     cargo run --release --example url_rag_server
 //!
@@ -84,7 +101,8 @@ use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config, DTYPE};
 use hf_hub::HFClientSync;
 use latent_db::{
-    BoundaryClassId, Digest, LatentDb, LatentDbError, SearchHit, SteeringError, SteeringVector,
+    bifurcation_ratio, cosine_sim, path_geometry, BifurcationResult, BoundaryClassId, Digest,
+    LatentDb, LatentDbError, PathGeometry, SearchHit, SteeringError, SteeringVector,
 };
 use scraper::{Html as Document, Selector};
 use serde::{Deserialize, Serialize};
@@ -596,6 +614,37 @@ const BUILD_SEED: u64 = 42;
 /// against a synthetic, network-free corpus.
 const BOUNDARY_K_NEAREST: usize = 4;
 
+/// `k_nearest` for the Graph Explorer tab's `ViableGraph` (Issue #17) -- a
+/// separate constant from `BOUNDARY_K_NEAREST` even though they currently
+/// hold the same value, since the two tabs want different (and in general
+/// independently tunable) things from their graph: Boundary Classes wants a
+/// *sparse* graph so `boundary_classes()` produces an interesting partition,
+/// while Graph Explorer wants a *connected* one so `geodesic()` between two
+/// arbitrarily-picked records (often from different topics) actually finds
+/// a path rather than reporting "unreachable".
+///
+/// Verified empirically against the real seed corpus (embedded with the
+/// real MiniLM model, not a synthetic stand-in): `cargo run --release
+/// --example url_rag_server`, then driving `POST /graph/explore` over every
+/// one of the 48 seed records' 2256 ordered `(key_a, key_b)` pairs on a
+/// freshly started server, currently finds a `geodesic` for all 2256 pairs
+/// -- zero unreachable, hop counts ranging 1-5 (mean ~2.5) -- and every one
+/// of those geodesics' `bifurcation_ratio()` comparisons comes back with a
+/// finite `separation_ratio` (never the `+-inf` edge case
+/// `BifurcationView::separation_ratio`'s `None` guards against). This is a
+/// live, re-checkable fact about the current corpus/model/algorithm, not a
+/// guarantee -- unlike `BOUNDARY_K_NEAREST`'s own note, there's no
+/// synthetic network-free test pinning full connectivity itself (that would
+/// mean asserting a *global* graph property across a whole corpus, not a
+/// *local* per-node property like `boundary_classes`' same-cluster-collision
+/// shape), but `geodesic_diagnostics_reports_graph_stats_even_when_
+/// unreachable` below still exercises the `None` (unreachable) branch
+/// directly, on a synthetic corpus deliberately built to disconnect at this
+/// constant's value (`per_cluster = GRAPH_K_NEAREST + 2`), so that code path
+/// stays covered independent of whether the real corpus happens to trigger
+/// it.
+const GRAPH_K_NEAREST: usize = 4;
+
 /// Numerical floor for the L2 norm of `key_b`'s embedding minus `key_a`'s,
 /// checked before normalizing into a direction in
 /// `Corpus::build_steering_vector` -- guards against dividing by (near)
@@ -741,17 +790,7 @@ impl Corpus {
             .classes()
             .into_iter()
             .enumerate()
-            .map(|(class_id, ids)| {
-                let records = ids
-                    .into_iter()
-                    .filter_map(|id| {
-                        let key = *self.id_to_key.get(&id)?;
-                        let metadata = self.db.get_metadata(id)?.to_string();
-                        Some((key, metadata))
-                    })
-                    .collect();
-                (class_id as BoundaryClassId, records)
-            })
+            .map(|(class_id, ids)| (class_id as BoundaryClassId, self.translate_path(&ids)))
             .collect()
     }
 
@@ -811,6 +850,164 @@ impl Corpus {
         SteeringVector::new(direction, alpha, STEERING_NORM_TOL)
             .map_err(SteeringBuildError::Steering)
     }
+
+    /// Translates a list of `LatentDb`-internal ids (a `ViableGraph` path, or
+    /// a `boundary_classes()` group) back to stable `(RecordKey, metadata)`
+    /// pairs. Shared by `boundary_classes` and `geodesic_diagnostics` (which
+    /// alone needs it twice: the geodesic path and its comparison walk).
+    fn translate_path(&self, path: &[u64]) -> Vec<(RecordKey, String)> {
+        path.iter()
+            .filter_map(|&id| {
+                let key = *self.id_to_key.get(&id)?;
+                let metadata = self.db.get_metadata(id)?.to_string();
+                Some((key, metadata))
+            })
+            .collect()
+    }
+
+    /// Builds a `ViableGraph` over every currently-stored record (predicate:
+    /// accept all, same as `boundary_classes`, `k_nearest` = `GRAPH_K_NEAREST`
+    /// -- Issue #17's own graph, deliberately denser than Boundary Classes'),
+    /// then computes `geodesic(key_a, key_b)` plus its `trajectory` geometry
+    /// and a `bifurcation_ratio()` comparison, all translated back to stable
+    /// `RecordKey`s.
+    ///
+    /// Returns `Err(key)` naming whichever of `key_a`/`key_b` was never
+    /// issued. `GraphExploreResult::geodesic` is `None` (not an error) when
+    /// both keys are valid but `key_b` is unreachable from `key_a` in this
+    /// graph -- an ordinary outcome for a sparsely-connected corpus, not a
+    /// failure; `n_nodes`/`n_edges` are still reported in that case.
+    ///
+    /// The comparison path's anchor-at-`path[1]` construction is explained
+    /// in this file's module doc. Walking `hops` steps from that anchor
+    /// keeps it the same length as the geodesic (`bifurcation_ratio`
+    /// requires equal lengths), so there's nothing to compare when the
+    /// geodesic is trivial (`key_a == key_b`, zero hops) -- `comparison` is
+    /// `None` in that case.
+    fn geodesic_diagnostics(
+        &self,
+        key_a: RecordKey,
+        key_b: RecordKey,
+        seed: u64,
+    ) -> Result<GraphExploreResult, RecordKey> {
+        let id_a = *self.key_to_id.get(&key_a).ok_or(key_a)?;
+        let id_b = *self.key_to_id.get(&key_b).ok_or(key_b)?;
+
+        let graph = self.db.build_viable_graph(|_| true, GRAPH_K_NEAREST, false);
+        let n_nodes = graph.n_nodes();
+        let n_edges = graph.n_edges();
+
+        let geodesic = graph.geodesic(id_a, id_b).map(|path| {
+            let hops = path.len() - 1;
+            let geometry = path_geometry(&graph, &path);
+
+            let comparison = if hops == 0 {
+                None
+            } else {
+                let anchor = path[1];
+                let comparison_path = graph.random_walk(anchor, hops, seed);
+                let comparison_geometry = path_geometry(&graph, &comparison_path);
+                let bifurcation = bifurcation_ratio(&graph, &path, &comparison_path);
+                Some(GraphComparisonResult {
+                    path: self.translate_path(&comparison_path),
+                    geometry: comparison_geometry,
+                    bifurcation,
+                })
+            };
+
+            GeodesicResult {
+                path: self.translate_path(&path),
+                hops,
+                geometry,
+                comparison,
+            }
+        });
+
+        Ok(GraphExploreResult {
+            n_nodes,
+            n_edges,
+            geodesic,
+        })
+    }
+
+    /// Builds a `SteeringVector` from `key_a` -> `key_b` via
+    /// `build_steering_vector` (Issue #16's reusable piece -- not
+    /// reimplemented here), then runs a `weighted_random_walk()` from
+    /// `key_a`, biased by that vector's direction, next to a plain
+    /// `random_walk()` from the same start for comparison (Issue #17's Walk
+    /// mode).
+    ///
+    /// The weight function scores each walk candidate by the cosine
+    /// similarity between its graph coordinates and the steering direction
+    /// -- the same construction `manifold::tests::
+    /// weighted_random_walk_biased_toward_a_steering_direction_beats_a_plain_random_walk`
+    /// validates biases a walk toward the steered-toward concept.
+    fn steered_walk(
+        &self,
+        key_a: RecordKey,
+        key_b: RecordKey,
+        alpha: f32,
+        steps: usize,
+        seed: u64,
+    ) -> Result<GraphWalkResult, SteeringBuildError> {
+        let steering = self.build_steering_vector(key_a, key_b, alpha)?;
+        // `build_steering_vector` already resolved `key_a` via
+        // `raw_embedding` (an `Ok` above implies it exists in `records`),
+        // and every key in `records` is re-registered into `key_to_id` on
+        // every rebuild (`build_db`), so this lookup can't fail here.
+        let id_a = *self
+            .key_to_id
+            .get(&key_a)
+            .expect("key_a resolved by build_steering_vector must also be in key_to_id");
+
+        let graph = self.db.build_viable_graph(|_| true, GRAPH_K_NEAREST, false);
+        let biased = graph.weighted_random_walk(id_a, steps, seed, |_, cand| {
+            graph
+                .coords_of(cand)
+                .map(|c| cosine_sim(c, steering.as_slice()))
+                .unwrap_or(0.0)
+        });
+        let plain = graph.random_walk(id_a, steps, seed);
+
+        Ok(GraphWalkResult {
+            steering,
+            biased: self.translate_path(&biased),
+            plain: self.translate_path(&plain),
+        })
+    }
+}
+
+/// Return value of `Corpus::geodesic_diagnostics`, translated to stable
+/// `RecordKey`s -- kept as a plain struct (not the HTTP wire view) so
+/// `Corpus`'s own tests can assert on it without going through JSON.
+#[derive(Debug)]
+struct GraphExploreResult {
+    n_nodes: usize,
+    n_edges: usize,
+    geodesic: Option<GeodesicResult>,
+}
+
+#[derive(Debug)]
+struct GeodesicResult {
+    path: Vec<(RecordKey, String)>,
+    hops: usize,
+    geometry: PathGeometry,
+    comparison: Option<GraphComparisonResult>,
+}
+
+#[derive(Debug)]
+struct GraphComparisonResult {
+    path: Vec<(RecordKey, String)>,
+    geometry: PathGeometry,
+    bifurcation: BifurcationResult,
+}
+
+/// Return value of `Corpus::steered_walk`.
+#[derive(Debug)]
+struct GraphWalkResult {
+    steering: SteeringVector,
+    biased: Vec<(RecordKey, String)>,
+    plain: Vec<(RecordKey, String)>,
 }
 
 /// Failure modes for `Corpus::build_steering_vector`, mapped to distinct
@@ -1228,6 +1425,22 @@ struct SteeringSearchResponse {
     steered: Vec<SearchHitView>,
 }
 
+/// Maps a `SteeringBuildError` to its HTTP status: an unknown key is a 404
+/// (nothing there to find), a degenerate pick or an out-of-range alpha is a
+/// 400 (the request itself is malformed) -- shared between
+/// `SteeringSearchError::into_response` and `graph_walk_handler`, the two
+/// handlers that each wrap `Corpus::build_steering_vector` (directly, or via
+/// `steered_walk`) and need to report the same failure the same way.
+fn steering_build_error_response(e: SteeringBuildError) -> (StatusCode, String) {
+    let status = match e {
+        SteeringBuildError::UnknownKey(_) => StatusCode::NOT_FOUND,
+        SteeringBuildError::DegenerateDirection | SteeringBuildError::Steering(_) => {
+            StatusCode::BAD_REQUEST
+        }
+    };
+    (status, e.to_string())
+}
+
 /// Everything that can go wrong building+running a steered search, kept
 /// distinct from `anyhow::Error` (unlike `run_ingest`/`run_search`) so
 /// `steering_search_handler` can report an unknown key or a degenerate pick
@@ -1244,10 +1457,7 @@ impl SteeringSearchError {
             // `{e:#}`, same as `run_ingest`/`run_search`'s own mapping, so a
             // chained anyhow error keeps its full context.
             SteeringSearchError::Embed(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
-            SteeringSearchError::Build(e @ SteeringBuildError::UnknownKey(_)) => {
-                (StatusCode::NOT_FOUND, e.to_string())
-            }
-            SteeringSearchError::Build(e) => (StatusCode::BAD_REQUEST, e.to_string()),
+            SteeringSearchError::Build(e) => steering_build_error_response(e),
         }
     }
 }
@@ -1306,6 +1516,170 @@ fn run_steering_search(
     })
 }
 
+// ---------------------------------------------------------------------
+// Graph Explorer (Issue #17): `Corpus::geodesic_diagnostics`/`steered_walk`
+// (defined above, alongside `Corpus`) plus the HTTP layer for the tab's two
+// modes -- Path (geodesic + trajectory geometry + bifurcation_ratio) and
+// Walk (steered vs. plain random walk).
+// ---------------------------------------------------------------------
+
+/// Wire view of one record on a rendered graph path/walk.
+#[derive(Serialize)]
+struct GraphNodeView {
+    key: RecordKey,
+    metadata: String,
+}
+
+fn graph_node_views(path: Vec<(RecordKey, String)>) -> Vec<GraphNodeView> {
+    path.into_iter()
+        .map(|(key, metadata)| GraphNodeView { key, metadata })
+        .collect()
+}
+
+/// Wire view of a `trajectory::PathGeometry`.
+#[derive(Serialize)]
+struct PathGeometryView {
+    length: f32,
+    mean_curvature: f32,
+    min_adjacent_cosine: f32,
+    n_steps: usize,
+}
+
+fn path_geometry_view(g: &PathGeometry) -> PathGeometryView {
+    PathGeometryView {
+        length: g.length,
+        mean_curvature: g.mean_curvature,
+        min_adjacent_cosine: g.min_adjacent_cosine,
+        n_steps: g.n_steps,
+    }
+}
+
+/// Wire view of a `trajectory::BifurcationResult`. `separation_ratio` is
+/// `None` (rather than a raw `f32`) whenever it's non-finite -- `serde_json`
+/// can't represent `+-inf` (that edge case fires when the comparison path's
+/// first step lands exactly on the geodesic's own start coordinate, an
+/// `initial_sep <= epsilon` `bifurcation_ratio` treats specially, see its
+/// doc comment) and would otherwise silently serialize it as JSON `null`
+/// for the UI's `.toFixed()` call to crash on, rather than a value this view
+/// deliberately marks absent.
+#[derive(Serialize)]
+struct BifurcationView {
+    separation_ratio: Option<f32>,
+    onset_step: Option<usize>,
+    final_separation: f32,
+}
+
+fn bifurcation_view(b: &BifurcationResult) -> BifurcationView {
+    BifurcationView {
+        separation_ratio: b.separation_ratio.is_finite().then_some(b.separation_ratio),
+        onset_step: b.onset_step,
+        final_separation: b.final_separation,
+    }
+}
+
+#[derive(Deserialize)]
+struct GraphExploreRequest {
+    key_a: RecordKey,
+    key_b: RecordKey,
+    seed: u64,
+}
+
+#[derive(Serialize)]
+struct GraphComparisonView {
+    path: Vec<GraphNodeView>,
+    geometry: PathGeometryView,
+    bifurcation: BifurcationView,
+}
+
+#[derive(Serialize)]
+struct GeodesicView {
+    path: Vec<GraphNodeView>,
+    hops: usize,
+    geometry: PathGeometryView,
+    /// `None` when `hops == 0` (`key_a == key_b`) -- no second node to
+    /// anchor a same-length comparison path at, see
+    /// `Corpus::geodesic_diagnostics`.
+    comparison: Option<GraphComparisonView>,
+}
+
+#[derive(Serialize)]
+struct GraphExploreResponse {
+    n_nodes: usize,
+    n_edges: usize,
+    /// `None` when `key_b` is unreachable from `key_a` in this graph -- an
+    /// ordinary outcome, not an error (see `Corpus::geodesic_diagnostics`).
+    geodesic: Option<GeodesicView>,
+}
+
+/// No `spawn_blocking`, same reasoning as `boundary_classes_handler`: an
+/// O(n^2) graph build plus a geodesic/geometry pass, no model/network I/O.
+async fn graph_explore_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<GraphExploreRequest>,
+) -> Result<Json<GraphExploreResponse>, (StatusCode, String)> {
+    let corpus = state.corpus.lock().unwrap();
+    let result = corpus
+        .geodesic_diagnostics(req.key_a, req.key_b, req.seed)
+        .map_err(|bad_key| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("unknown record key {}", bad_key.0),
+            )
+        })?;
+    drop(corpus);
+
+    let geodesic = result.geodesic.map(|r| GeodesicView {
+        path: graph_node_views(r.path),
+        hops: r.hops,
+        geometry: path_geometry_view(&r.geometry),
+        comparison: r.comparison.map(|c| GraphComparisonView {
+            path: graph_node_views(c.path),
+            geometry: path_geometry_view(&c.geometry),
+            bifurcation: bifurcation_view(&c.bifurcation),
+        }),
+    });
+
+    Ok(Json(GraphExploreResponse {
+        n_nodes: result.n_nodes,
+        n_edges: result.n_edges,
+        geodesic,
+    }))
+}
+
+#[derive(Deserialize)]
+struct GraphWalkRequest {
+    key_a: RecordKey,
+    key_b: RecordKey,
+    alpha: f32,
+    steps: usize,
+    seed: u64,
+}
+
+#[derive(Serialize)]
+struct GraphWalkResponse {
+    steering: SteeringVectorView,
+    biased: Vec<GraphNodeView>,
+    plain: Vec<GraphNodeView>,
+}
+
+/// No `spawn_blocking`, same reasoning as `graph_explore_handler`.
+async fn graph_walk_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<GraphWalkRequest>,
+) -> Result<Json<GraphWalkResponse>, (StatusCode, String)> {
+    let corpus = state.corpus.lock().unwrap();
+    let result = corpus
+        .steered_walk(req.key_a, req.key_b, req.alpha, req.steps, req.seed)
+        .map_err(steering_build_error_response)?;
+    drop(corpus);
+
+    Ok(Json(GraphWalkResponse {
+        steering: steering_vector_view(&result.steering),
+        biased: graph_node_views(result.biased),
+        plain: graph_node_views(result.plain),
+    }))
+}
+
 async fn index_handler(State(state): State<Arc<AppState>>) -> Html<String> {
     let total_records = state.corpus.lock().unwrap().db.len();
     Html(render_index_html(total_records))
@@ -1346,6 +1720,8 @@ async fn main() -> Result<()> {
         .route("/integrity/verify", post(integrity_verify_handler))
         .route("/boundary-classes", get(boundary_classes_handler))
         .route("/steering/search", post(steering_search_handler))
+        .route("/graph/explore", post(graph_explore_handler))
+        .route("/graph/walk", post(graph_walk_handler))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", PORT)).await?;
@@ -1906,6 +2282,205 @@ mod tests {
             "steering strongly toward B should bring it into the rendered top-{SEARCH_K} \
              even though it isn't there in the plain ranking \
              (plain_has_b={plain_has_b}, steered_has_b={steered_has_b})"
+        );
+    }
+
+    // Corpus::geodesic_diagnostics (Issue #17, Path mode)
+
+    #[test]
+    fn geodesic_diagnostics_rejects_an_unknown_key_a() {
+        let seed = synthetic_records(10, 16);
+        let corpus = Corpus::seed(seed).expect("seed build should succeed");
+        let key_b = corpus.records[1].key;
+        let bogus = RecordKey(9999);
+
+        let err = corpus
+            .geodesic_diagnostics(bogus, key_b, 1)
+            .expect_err("an unissued key_a should be rejected");
+        assert_eq!(err, bogus);
+    }
+
+    #[test]
+    fn geodesic_diagnostics_rejects_an_unknown_key_b() {
+        let seed = synthetic_records(10, 16);
+        let corpus = Corpus::seed(seed).expect("seed build should succeed");
+        let key_a = corpus.records[0].key;
+        let bogus = RecordKey(9999);
+
+        let err = corpus
+            .geodesic_diagnostics(key_a, bogus, 1)
+            .expect_err("an unissued key_b should be rejected");
+        assert_eq!(err, bogus);
+    }
+
+    #[test]
+    fn geodesic_diagnostics_trivial_path_when_keys_are_identical() {
+        let seed = synthetic_records(10, 16);
+        let corpus = Corpus::seed(seed).expect("seed build should succeed");
+        let key_a = corpus.records[0].key;
+
+        let result = corpus
+            .geodesic_diagnostics(key_a, key_a, 1)
+            .expect("both keys are valid");
+        let geodesic = result
+            .geodesic
+            .expect("a record is trivially reachable from itself");
+        assert_eq!(geodesic.hops, 0);
+        assert_eq!(geodesic.path.len(), 1);
+        assert_eq!(geodesic.path[0].0, key_a);
+        assert!(
+            geodesic.comparison.is_none(),
+            "a zero-hop geodesic has no second node to anchor a comparison walk at"
+        );
+    }
+
+    /// The core correctness requirement behind Issue #17's bifurcation
+    /// diagnostic: the comparison path must *not* start at `key_a` itself
+    /// (see this file's module doc for why -- that would put
+    /// `bifurcation_ratio` in its zero-initial-separation edge case on every
+    /// request) but at the geodesic's own second node, and it must be the
+    /// same length as the geodesic path (`bifurcation_ratio` requires equal
+    /// lengths to report anything but its default).
+    #[test]
+    fn geodesic_diagnostics_anchors_the_comparison_path_at_the_geodesics_second_node() {
+        let seed = synthetic_records(25, 16);
+        let corpus = Corpus::seed(seed).expect("seed build should succeed");
+        let key_a = corpus.records[0].key;
+        let key_b = corpus.records[15].key;
+
+        let result = corpus
+            .geodesic_diagnostics(key_a, key_b, 7)
+            .expect("both keys are valid");
+        let geodesic = result
+            .geodesic
+            .expect("a reasonably dense random synthetic graph should connect these two");
+        assert!(
+            geodesic.hops >= 1,
+            "key_a != key_b should take at least one hop"
+        );
+
+        let comparison = geodesic
+            .comparison
+            .as_ref()
+            .expect("a >=1-hop geodesic should always produce a comparison path");
+        assert_eq!(
+            comparison.path.len(),
+            geodesic.path.len(),
+            "bifurcation_ratio requires equal-length paths"
+        );
+        assert_eq!(
+            comparison.path[0].0, geodesic.path[1].0,
+            "the comparison path should start at the geodesic's own second node, not key_a"
+        );
+    }
+
+    #[test]
+    fn geodesic_diagnostics_reports_graph_stats_even_when_unreachable() {
+        // Same reasoning as `boundary_classes_never_mixes_two_different_
+        // clusters_into_one_class`'s generator, but with more same-cluster
+        // neighbors than GRAPH_K_NEAREST so every node's kNN pass stays
+        // entirely inside its own cluster -- four disconnected components.
+        let per_cluster = GRAPH_K_NEAREST + 2;
+        let clustered = synthetic_clustered_records(4, per_cluster, 16);
+        let seed: Vec<(Vec<f32>, String)> = clustered
+            .iter()
+            .map(|(v, _, m)| (v.clone(), m.clone()))
+            .collect();
+        let corpus = Corpus::seed(seed).expect("seed build should succeed");
+        let key_a = corpus.records[0].key; // cluster 0
+        let key_b = corpus.records[per_cluster].key; // cluster 1
+
+        let result = corpus
+            .geodesic_diagnostics(key_a, key_b, 1)
+            .expect("both keys are valid");
+        assert_eq!(result.n_nodes, corpus.records.len());
+        assert!(result.n_edges > 0);
+        assert!(
+            result.geodesic.is_none(),
+            "the two picked records are in disconnected clusters"
+        );
+    }
+
+    // Corpus::steered_walk (Issue #17, Walk mode)
+
+    #[test]
+    fn steered_walk_rejects_an_unknown_key() {
+        let seed = synthetic_records(10, 16);
+        let corpus = Corpus::seed(seed).expect("seed build should succeed");
+        let key_a = corpus.records[0].key;
+        let bogus = RecordKey(9999);
+
+        let err = corpus
+            .steered_walk(key_a, bogus, 1.0, 5, 1)
+            .expect_err("an unissued key should be rejected");
+        assert!(matches!(err, SteeringBuildError::UnknownKey(k) if k == bogus));
+    }
+
+    #[test]
+    fn steered_walk_returns_a_valid_steering_vector_and_equal_length_walks() {
+        let seed = synthetic_records(20, 16);
+        let corpus = Corpus::seed(seed).expect("seed build should succeed");
+        let key_a = corpus.records[0].key;
+        let key_b = corpus.records[10].key;
+
+        let result = corpus
+            .steered_walk(key_a, key_b, 0.7, 6, 3)
+            .expect("build should succeed");
+        assert!(result.steering.verify(STEERING_NORM_TOL));
+        assert_eq!(result.steering.alpha(), 0.7);
+        assert_eq!(result.biased.len(), 7);
+        assert_eq!(result.plain.len(), 7);
+        assert_eq!(result.biased[0].0, key_a);
+        assert_eq!(result.plain[0].0, key_a);
+    }
+
+    /// Pins that `steered_walk` wires `build_steering_vector`'s direction
+    /// into `weighted_random_walk`'s weight function correctly (not, e.g.,
+    /// inverted or ignored): steering from A toward a record that's already
+    /// one of A's direct graph neighbors should make a single-step biased
+    /// walk land on that neighbor far more often than a plain walk does,
+    /// across many seeds -- the same "biased beats plain" claim
+    /// `manifold::tests::weighted_random_walk_biased_toward_a_steering_
+    /// direction_beats_a_plain_random_walk` pins at the library layer,
+    /// exercised here end-to-end through this demo's own construction.
+    #[test]
+    fn steered_walk_biased_walk_favors_a_direct_neighbor_far_more_than_plain_walk() {
+        let seed = synthetic_records(30, 16);
+        let corpus = Corpus::seed(seed).expect("seed build should succeed");
+        let key_a = corpus.records[0].key;
+        let id_a = *corpus.key_to_id.get(&key_a).unwrap();
+
+        let graph = corpus
+            .db
+            .build_viable_graph(|_| true, GRAPH_K_NEAREST, false);
+        let neighbors = graph.neighbors(id_a);
+        assert!(
+            !neighbors.is_empty(),
+            "a random 30-record graph should connect id_a"
+        );
+        let target_id = neighbors[0];
+        let key_b = *corpus.id_to_key.get(&target_id).unwrap();
+
+        let trials: u64 = 200;
+        let mut biased_hits = 0u32;
+        let mut plain_hits = 0u32;
+        for trial_seed in 0..trials {
+            let result = corpus
+                .steered_walk(key_a, key_b, 1.0, 1, trial_seed)
+                .expect("build should succeed");
+            if result.biased[1].0 == key_b {
+                biased_hits += 1;
+            }
+            if result.plain[1].0 == key_b {
+                plain_hits += 1;
+            }
+        }
+        let biased_rate = biased_hits as f32 / trials as f32;
+        let plain_rate = plain_hits as f32 / trials as f32;
+        assert!(
+            biased_rate > plain_rate + 0.2,
+            "a walk steered straight at a direct neighbor should land on it far more often \
+             than a plain walk: biased_rate={biased_rate}, plain_rate={plain_rate}"
         );
     }
 }
