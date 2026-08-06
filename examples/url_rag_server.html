@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>latent-db URL RAG demo</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 3rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.25rem; }
+  #status { color: #666; font-size: 0.9rem; margin-bottom: 1.5rem; }
+  nav.tabs { display: flex; gap: 0.25rem; border-bottom: 1px solid #ddd; margin-bottom: 1.5rem; }
+  nav.tabs button { padding: 0.5rem 1rem; font-size: 0.95rem; border: none; background: none; cursor: pointer; border-bottom: 2px solid transparent; }
+  nav.tabs button.active { border-bottom-color: #333; font-weight: 600; }
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
+  form { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+  input[type=text] { flex: 1; min-width: 14rem; padding: 0.5rem; font-size: 1rem; }
+  button { padding: 0.5rem 1rem; font-size: 1rem; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  ul { list-style: none; padding: 0; }
+  li { padding: 0.6rem; border: 1px solid #ddd; border-radius: 6px; margin: 0.4rem 0; }
+  .key { color: #888; font-size: 0.8rem; }
+  .hint { color: #888; font-size: 0.85rem; margin: 0.5rem 0; }
+  .error { color: #b00020; }
+</style>
+</head>
+<body>
+<h1>latent-db URL RAG demo</h1>
+<p id="status">__TOTAL_RECORDS__ records loaded.</p>
+
+<nav class="tabs">
+  <button class="tab-btn active" data-tab="ingest" type="button">Ingest</button>
+</nav>
+
+<section id="tab-ingest" class="tab-panel active">
+  <p class="hint">Paste an English article URL. The server fetches it, extracts the readable
+    text, splits it into token-budgeted chunks, embeds each chunk with MiniLM, and folds it
+    into the accumulating <code>LatentDb</code> (re-ingesting the same URL will not grow the
+    record count -- content-hash dedup collapses the repeat chunks).</p>
+  <form id="ingest-form">
+    <input id="ingest-url" type="text" placeholder="https://example.com/some-article" />
+    <button id="ingest-button" type="submit">Ingest</button>
+  </form>
+  <p id="ingest-status" class="hint"></p>
+  <ul id="ingest-chunks"></ul>
+</section>
+
+<script type="module">
+// Generic tab-shell wiring: later tabs (Search, Integrity, Boundary
+// Classes, Steering, Graph Explorer, Bandit Arena) just add a
+// `.tab-btn[data-tab=...]` + `#tab-<name>.tab-panel` pair -- no changes
+// needed here.
+const tabButtons = document.querySelectorAll(".tab-btn");
+const tabPanels = document.querySelectorAll(".tab-panel");
+tabButtons.forEach((btn) => {
+  btn.addEventListener("click", () => {
+    tabButtons.forEach((b) => b.classList.remove("active"));
+    tabPanels.forEach((p) => p.classList.remove("active"));
+    btn.classList.add("active");
+    document.getElementById(`tab-${btn.dataset.tab}`).classList.add("active");
+  });
+});
+
+const statusEl = document.getElementById("status");
+const form = document.getElementById("ingest-form");
+const urlInput = document.getElementById("ingest-url");
+const button = document.getElementById("ingest-button");
+const ingestStatusEl = document.getElementById("ingest-status");
+const chunksEl = document.getElementById("ingest-chunks");
+
+form.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const url = urlInput.value.trim();
+  if (!url) return;
+
+  button.disabled = true;
+  ingestStatusEl.classList.remove("error");
+  ingestStatusEl.textContent = "Fetching, extracting, embedding...";
+  chunksEl.innerHTML = "";
+  try {
+    const resp = await fetch("/ingest", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url }),
+    });
+    if (!resp.ok) {
+      // Error responses are plain text (see `(StatusCode, String)` in the
+      // server), not JSON.
+      const text = await resp.text();
+      throw new Error(text || `request failed with status ${resp.status}`);
+    }
+    const body = await resp.json();
+    ingestStatusEl.textContent =
+      `${body.chunks_added} chunk(s) processed (${body.net_new_records} net-new), ` +
+      `${body.total_records} total record(s) now.`;
+    statusEl.textContent = `${body.total_records} records loaded.`;
+    for (const chunk of body.chunks) {
+      const li = document.createElement("li");
+      li.innerHTML = `<div class="key">key=${chunk.key}</div>${chunk.preview}`;
+      chunksEl.appendChild(li);
+    }
+  } catch (err) {
+    ingestStatusEl.classList.add("error");
+    ingestStatusEl.textContent = `Error: ${err.message}`;
+  } finally {
+    button.disabled = false;
+  }
+});
+</script>
+</body>
+</html>

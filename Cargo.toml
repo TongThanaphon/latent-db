@@ -47,6 +47,17 @@ getrandom = { version = "0.2", features = ["js"] }
 name = "demo"
 path = "examples/demo.rs"
 
+# test = true: examples default to `test = false` (plain `cargo test` won't
+# build or run them), but this one carries `#[cfg(test)] mod tests` covering
+# its network-free logic (sentence/chunk splitting, paragraph extraction,
+# Corpus key stability) -- opt in so the repo's pre-commit hook (`cargo
+# test`, unqualified) actually exercises them instead of leaving them as
+# manual-run-only via `cargo test --example url_rag_server`.
+[[example]]
+name = "url_rag_server"
+path = "examples/url_rag_server.rs"
+test = true
+
 [[bin]]
 name = "latentdb-cli"
 path = "src/bin/latentdb-cli/main.rs"
@@ -91,7 +102,9 @@ candle-core = "0.11.0"
 candle-nn = "0.11.0"
 candle-transformers = "0.11.0"
 hf-hub = { version = "1.0.0", features = ["blocking"] }
+scraper = "0.27.0"
 serde_json = "1.0.151"
 tokenizers = "0.23.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tower-http = { version = "0.6", features = ["cors"] }
+ureq = "3.3.0"
