@@ -81,6 +81,29 @@
 //! the same reusable piece Steering owns, not reimplemented here -- next to
 //! a plain `random_walk()` from the same start for comparison.
 //!
+//! The seventh tab is **Bandit Arena** (Issue #18): builds a `RegionTree`
+//! (`LatentDb::build_region_tree`, see the `bandit` module) over every
+//! currently-stored record's decoded approximate vector, frozen inside a
+//! `Corpus::bandit_session` for the life of that session -- `Corpus::rebuild`
+//! drops it, so the next cycle after any ingest lazily builds a fresh one
+//! rather than trying to migrate belief state onto a changed record set (the
+//! same "rebuild rather than incrementally maintain" contract
+//! `build_viable_graph`/`build_region_tree` already make). Each cycle embeds
+//! the typed query, Thompson-samples an arm via `RegionTree::sample()`, and
+//! ranks that arm's whole *region* (`RegionTree::region_members()` -- the
+//! sibling group `sample()` narrowed down to, one branch above the sampled
+//! leaf) by cosine similarity to the query, using the same PQ-decoded vectors
+//! the tree itself was built over so "best match in this region" stays
+//! consistent with the structure that put them there. A thumbs up/down on any
+//! rendered candidate feeds `RegionTree::observe()` on that specific record --
+//! since every candidate shares the sampled arm's immediate parent, observing
+//! any of them moves the same region's Empirical Bayes aggregate, biasing
+//! later `sample()` calls this session toward (or away from) that region. The
+//! live per-region sample-count view is seeded with every region in the tree
+//! at zero, not just the ones a cycle happens to have sampled yet, so a
+//! viewer can watch one region's share climb against the others as repeated
+//! positive feedback lands on it.
+//!
 //! Run with:
 //!     cargo run --release --example url_rag_server
 //!
@@ -102,7 +125,8 @@ use candle_transformers::models::bert::{BertModel, Config, DTYPE};
 use hf_hub::HFClientSync;
 use latent_db::{
     bifurcation_ratio, cosine_sim, path_geometry, BifurcationResult, BoundaryClassId, Digest,
-    LatentDb, LatentDbError, PathGeometry, SearchHit, SteeringError, SteeringVector,
+    LatentDb, LatentDbError, PathGeometry, RegionTree, RegionTreeConfig, SearchHit, SteeringError,
+    SteeringVector,
 };
 use scraper::{Html as Document, Selector};
 use serde::{Deserialize, Serialize};
@@ -660,6 +684,70 @@ const STEERING_MIN_DIRECTION_NORM: f32 = 1e-6;
 /// "these two records are too similar" `DegenerateDirection` case above.
 const STEERING_NORM_TOL: f32 = 1e-3;
 
+/// `RegionTree` config for the Bandit Arena tab (Issue #18), deliberately
+/// overriding `RegionTreeConfig::default()`'s `max_depth: 4` down to `1`:
+/// with `max_depth: 1`, `bandit::build_recursive`'s depth-0 call still splits
+/// (this corpus is always well over `min_leaf_size`), but every depth-1
+/// recursive call immediately hits `depth >= max_depth` and flattens its
+/// bucket into a flat group of leaves rather than splitting again -- so the
+/// tree always has *exactly one* level of real branching, and each of that
+/// split's (up to `branching_factor`) non-empty buckets is a "region"
+/// (`RegionTree::region_members()`'s immediate-parent group) in its own
+/// right. This is what makes a region's sample-count share move visibly
+/// after a human's worth of thumbs-up/down clicks: `RegionTreeConfig::
+/// default()`'s `max_depth: 4` / `min_leaf_size: 4` instead recurses this
+/// corpus's ~48 records down to a dozen-plus regions of ~3-4 records each,
+/// too many rows, each too thin a slice of the total, to visibly concentrate
+/// in a demo-length session. Verified empirically against the real seed
+/// corpus (embedded with the real MiniLM model, not a synthetic stand-in):
+/// `cargo run --release --example url_rag_server`, then driving `POST
+/// /bandit/query` against a freshly started server currently produces 4
+/// regions of sizes 8/20/10/10 over the 48 seed records -- the size-8 region
+/// is exactly the "cooking" topic's 8 seed records, a clean one-topic-one-
+/// region split, while the other three each mix several topics. Repeating
+/// `POST /bandit/feedback` with `reward: 1.0` every time the top-ranked
+/// candidate came from the size-8 region (`reward: 0.0` otherwise), 22
+/// cycles total, visibly concentrated `sample()` there: 19 of that session's
+/// 22 samples landed in the size-8 region by the end, versus 1 apiece for
+/// the other three. This is a live, re-checkable fact about the current
+/// corpus/model/algorithm, not a guarantee (k-means could in principle
+/// degenerate to fewer non-empty buckets, or split less cleanly, on a
+/// different corpus) -- `bandit_repeated_positive_feedback_shifts_sample_
+/// share_toward_the_rewarded_cluster` below pins the same *shape* of
+/// behavior (a rewarded region's later-session sample share beating a
+/// same-length no-feedback baseline's) against a synthetic, network-free
+/// clustered corpus instead.
+fn bandit_region_config() -> RegionTreeConfig {
+    RegionTreeConfig {
+        branching_factor: 4,
+        max_depth: 1,
+        ..RegionTreeConfig::default()
+    }
+}
+
+/// The Bandit Arena tab's live session state (Issue #18): a frozen
+/// `RegionTree` plus its mutable Thompson-sampling/observation state for one
+/// session. Deliberately holds no id/metadata snapshot of its own (unlike
+/// e.g. `RawRecord`) -- `Corpus::bandit_session`'s own doc comment explains
+/// why a live `Some` here is always safe to read straight against the
+/// enclosing `Corpus`'s current `id_to_key`/`db`.
+struct BanditSession {
+    tree: RegionTree,
+    /// Every region (`RegionTree::region_members()`'s immediate-parent
+    /// group) in `tree` and its sample count so far this session, in a
+    /// fixed order -- each region's own smallest member id, ascending, set
+    /// once at build time (`Corpus::build_bandit_session`) -- so the live
+    /// count view's rows never reshuffle between requests. A linear scan
+    /// (`Vec`, not `HashMap`) per cycle over up to `branching_factor`
+    /// regions -- too few for a hash lookup to be worth a second data
+    /// structure kept in sync with this one.
+    region_counts: Vec<(Vec<u64>, usize)>,
+    /// Monotonic counter, incremented once per `Corpus::bandit_query` cycle
+    /// and reused (not separately advanced) by the `RegionTree::observe()`
+    /// call a later `Corpus::bandit_feedback` makes.
+    step: u64,
+}
+
 struct Corpus {
     /// Append-only source of truth: every chunk ever accepted, in the
     /// order it was accepted. Never reordered or truncated, so a
@@ -675,6 +763,13 @@ struct Corpus {
     /// Current `db` id -> the first (canonical) key that resolved to it,
     /// used to label search-style results with one key per live record.
     id_to_key: HashMap<u64, RecordKey>,
+    /// The Bandit Arena tab's live session (Issue #18), if one has been
+    /// started (lazily, on the first `/bandit/query`). `None` here always
+    /// means "next query builds a fresh one" -- `rebuild()` clears it, so a
+    /// `Some` is always built from exactly the `key_to_id`/`id_to_key` (and
+    /// therefore `db`) currently in this `Corpus`, never a set a later
+    /// ingest has since moved on from.
+    bandit_session: Option<BanditSession>,
 }
 
 impl Corpus {
@@ -696,6 +791,7 @@ impl Corpus {
             db: built.db,
             key_to_id: built.key_to_id,
             id_to_key: built.id_to_key,
+            bandit_session: None,
         })
     }
 
@@ -729,6 +825,12 @@ impl Corpus {
         self.db = built.db;
         self.key_to_id = built.key_to_id;
         self.id_to_key = built.id_to_key;
+        // Every id in the tree the old `bandit_session` was built over may
+        // now name a different record (or none) -- drop it rather than
+        // migrate; the next `/bandit/query` lazily builds a fresh one over
+        // the just-rebuilt `id_to_key` (Issue #18's "starts a fresh session
+        // rather than needing incremental tree updates" requirement).
+        self.bandit_session = None;
         Ok(())
     }
 
@@ -975,6 +1077,189 @@ impl Corpus {
             plain: self.translate_path(&plain),
         })
     }
+
+    /// Builds a fresh `RegionTree` over every currently-stored record
+    /// (`LatentDb::build_region_tree`, config `bandit_region_config()` --
+    /// see its own doc comment) and enumerates its regions once up front,
+    /// each starting at a sample count of `0` -- so the live sample-count
+    /// view (`bandit_query`'s `regions` field) can show every region from
+    /// the very first cycle, not just the ones a cycle happens to have
+    /// sampled yet.
+    fn build_bandit_session(&self) -> BanditSession {
+        let mut ids: Vec<u64> = self.id_to_key.keys().copied().collect();
+        ids.sort_unstable();
+        let tree = self.db.build_region_tree(bandit_region_config());
+
+        let raw_regions: Vec<Vec<u64>> = ids
+            .iter()
+            .map(|&id| {
+                tree.region_members(id)
+                    .expect("every id used to build the tree is one of its own arms")
+            })
+            .collect();
+        // Work around a `RegionTree::region_members` edge case: a k-means
+        // split bucket of *exactly* one record becomes a bare `Leaf`, one
+        // path level shallower than a multi-record bucket's own flat group
+        // of leaves (`bandit::make_leaf_or_group`), so `region_members`
+        // strips one path level too many for that record and reports the
+        // *entire* tree as its region instead of just itself -- confirmed
+        // against this crate's own `RegionTree::build`/`region_members` with
+        // a record deliberately isolated in a singleton k-means bucket.
+        // Detectable without touching library internals: a real
+        // single-region tree (recursion never split at all) reports the
+        // full id set for *every* id; the bug instead produces a mix --
+        // some ids' regions properly sized, others spuriously the full set
+        // -- which a real partition could never do (every id's true region
+        // is a strict subset once more than one region exists).
+        let all_one_region = raw_regions.iter().all(|members| members.len() == ids.len());
+        let mut region_counts: Vec<(Vec<u64>, usize)> = Vec::new();
+        for (&id, members) in ids.iter().zip(raw_regions.iter()) {
+            let members = if !all_one_region && members.len() == ids.len() {
+                vec![id]
+            } else {
+                members.clone()
+            };
+            if !region_counts
+                .iter()
+                .any(|(existing, _)| *existing == members)
+            {
+                region_counts.push((members, 0));
+            }
+        }
+        region_counts.sort_by_key(|(members, _)| members[0]);
+
+        BanditSession {
+            tree,
+            region_counts,
+            step: 0,
+        }
+    }
+
+    /// Runs one Bandit Arena cycle (Issue #18): lazily (re)builds
+    /// `bandit_session` if none is active yet (first call this session, or
+    /// the previous call was followed by a rebuild that cleared it -- see
+    /// `rebuild`'s own doc comment), Thompson-samples an arm via
+    /// `RegionTree::sample()` (seeded by the session's own monotonic `step`
+    /// counter, incremented once per cycle -- `RegionTree::sample`'s own doc
+    /// comment recommends exactly this), then ranks that arm's whole region
+    /// (`RegionTree::region_members()`) against `query_embedding` by cosine
+    /// similarity over the same decoded approximate vectors the tree itself
+    /// was built over -- consistent with what put them in the same region,
+    /// unlike `build_steering_vector`, which needs full-precision embeddings
+    /// to avoid a two-record degenerate-direction edge case a region-wide
+    /// ranking doesn't share.
+    fn bandit_query(&mut self, query_embedding: &[f32]) -> BanditQueryResult {
+        if self.bandit_session.is_none() {
+            self.bandit_session = Some(self.build_bandit_session());
+        }
+        let session = self
+            .bandit_session
+            .as_mut()
+            .expect("just set to Some above if it wasn't already");
+
+        session.step += 1;
+        let step = session.step;
+        let arm_id = session.tree.sample(step);
+        let region = session
+            .tree
+            .region_members(arm_id)
+            .expect("sample() always returns a known arm of its own tree");
+
+        let entry = session
+            .region_counts
+            .iter_mut()
+            .find(|(members, _)| *members == region)
+            .expect("region_members(arm_id) always names a region build_bandit_session enumerated");
+        entry.1 += 1;
+        // Snapshot before touching `self.id_to_key`/`self.db` below --
+        // releases `session`'s mutable borrow of `self.bandit_session`
+        // rather than holding it across those unrelated fields.
+        let regions_snapshot = session.region_counts.clone();
+
+        // `filter_map`, not `.expect(...)`: a region member id should
+        // always resolve against the live `db` (rebuild() drops the whole
+        // session before any id it holds could stop resolving), but the
+        // same convention `hits_to_views` documents applies here too --
+        // drop a hit that doesn't resolve rather than panic on it.
+        let mut candidates: Vec<BanditCandidate> = region
+            .iter()
+            .filter_map(|&id| {
+                let key = *self.id_to_key.get(&id)?;
+                let vector = self.db.get_approx_vector(id)?;
+                let metadata = self.db.get_metadata(id)?.to_string();
+                Some(BanditCandidate {
+                    key,
+                    score: cosine_sim(query_embedding, &vector),
+                    metadata,
+                })
+            })
+            .collect();
+        candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+
+        let regions = regions_snapshot
+            .into_iter()
+            .map(|(members, sample_count)| BanditRegionCount {
+                keys: members
+                    .iter()
+                    .filter_map(|&id| self.id_to_key.get(&id).copied())
+                    .collect(),
+                sample_count,
+            })
+            .collect();
+
+        BanditQueryResult {
+            candidates,
+            regions,
+            step,
+        }
+    }
+
+    /// Applies Issue #18's Bandit Arena thumbs up/down: resolves `key` to
+    /// its `RegionTree` arm id via the corpus's current `key_to_id` (safe to
+    /// read straight against a live session without a separate snapshot --
+    /// see `bandit_session`'s own doc comment for why a `Some` session
+    /// always postdates the last rebuild) and feeds `reward` into
+    /// `RegionTree::observe()`, reusing the session's current `step` rather
+    /// than advancing it (see `BanditSession::step`'s doc comment).
+    ///
+    /// Returns the observed arm's updated `(alpha, beta)` belief, or `None`
+    /// if there's no active session yet, or `key` was never issued by this
+    /// `Corpus` -- both ordinary "nothing to observe" outcomes (e.g. a
+    /// stray feedback click after a rebuild reset the session), not errors.
+    fn bandit_feedback(&mut self, key: RecordKey, reward: f32) -> Option<(f32, f32)> {
+        let id = *self.key_to_id.get(&key)?;
+        let session = self.bandit_session.as_mut()?;
+        session.tree.observe(id, reward, session.step);
+        session.tree.leaf_belief(id)
+    }
+}
+
+/// Return value of `Corpus::bandit_query` (Issue #18), translated to stable
+/// `RecordKey`s -- kept as a plain struct (not the HTTP wire view) so
+/// `Corpus`'s own tests can assert on it without going through JSON.
+#[derive(Debug)]
+struct BanditQueryResult {
+    /// This cycle's sampled region, ranked by similarity to the query
+    /// (best match first).
+    candidates: Vec<BanditCandidate>,
+    /// Every region in the session's tree, in a fixed order (see
+    /// `Corpus::build_bandit_session`), with its sample count as of this
+    /// cycle.
+    regions: Vec<BanditRegionCount>,
+    step: u64,
+}
+
+#[derive(Debug)]
+struct BanditCandidate {
+    key: RecordKey,
+    score: f32,
+    metadata: String,
+}
+
+#[derive(Debug)]
+struct BanditRegionCount {
+    keys: Vec<RecordKey>,
+    sample_count: usize,
 }
 
 /// Return value of `Corpus::geodesic_diagnostics`, translated to stable
@@ -1680,6 +1965,131 @@ async fn graph_walk_handler(
     }))
 }
 
+// ---------------------------------------------------------------------
+// Bandit Arena (Issue #18): `Corpus::bandit_query`/`bandit_feedback`
+// (defined above, alongside `Corpus`) plus the HTTP layer for one Thompson-
+// sampled search-and-reward cycle.
+// ---------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct BanditQueryRequest {
+    query: String,
+}
+
+#[derive(Serialize)]
+struct BanditRegionView {
+    /// This region's member keys -- its identity for the live sample-count
+    /// view, since regions partition the tree's leaves (no two regions
+    /// share a member).
+    keys: Vec<RecordKey>,
+    sample_count: usize,
+}
+
+#[derive(Serialize)]
+struct BanditQueryResponse {
+    /// This cycle's Thompson-sampled region, ranked by similarity to the
+    /// query (best match first). Reuses `SearchHitView` -- same shape
+    /// (`key`/`score`/`metadata`), same precedent Steering's
+    /// `SteeringSearchResponse` already set for not minting a tab-local
+    /// twin of it.
+    candidates: Vec<SearchHitView>,
+    /// Every region in the session's tree and its sample count so far this
+    /// session, including regions not yet sampled (count 0).
+    regions: Vec<BanditRegionView>,
+    step: u64,
+}
+
+async fn bandit_query_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<BanditQueryRequest>,
+) -> Result<Json<BanditQueryResponse>, (StatusCode, String)> {
+    let query = req.query.trim().to_string();
+    if query.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "query must not be empty".to_string(),
+        ));
+    }
+
+    tokio::task::spawn_blocking(move || run_bandit_query(&state, &query))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map(Json)
+        // `{e:#}`, same as `run_search`/`run_ingest`, so a chained anyhow
+        // error keeps its full context.
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))
+}
+
+/// Embeds `query`, then runs one `Corpus::bandit_query` cycle -- locks
+/// taken and released entirely within this synchronous function, mirroring
+/// `run_search`/`run_steering_search`.
+fn run_bandit_query(state: &AppState, query: &str) -> Result<BanditQueryResponse> {
+    let embedding = embed_single_query(state, query)?;
+
+    let mut corpus = state.corpus.lock().unwrap();
+    let result = corpus.bandit_query(&embedding);
+    drop(corpus);
+
+    Ok(BanditQueryResponse {
+        candidates: result
+            .candidates
+            .into_iter()
+            .map(|c| SearchHitView {
+                key: c.key,
+                score: c.score,
+                metadata: c.metadata,
+            })
+            .collect(),
+        regions: result
+            .regions
+            .into_iter()
+            .map(|r| BanditRegionView {
+                keys: r.keys,
+                sample_count: r.sample_count,
+            })
+            .collect(),
+        step: result.step,
+    })
+}
+
+#[derive(Deserialize)]
+struct BanditFeedbackRequest {
+    key: RecordKey,
+    /// Thumbs up/down, sent as `1.0`/`0.0` by the UI -- `RegionBelief::
+    /// update` clamps to `[0, 1]` regardless, so this is passed through
+    /// unvalidated rather than re-checked here.
+    reward: f32,
+}
+
+#[derive(Serialize)]
+struct BanditFeedbackResponse {
+    /// The observed arm's updated Beta(alpha, beta) belief -- shown so a
+    /// viewer can see each click really did move something, the same
+    /// "visible confirmation" role `SteeringVectorView::commitment` plays
+    /// for the Steering tab.
+    alpha: f32,
+    beta: f32,
+}
+
+/// No `spawn_blocking`: `Corpus::bandit_feedback` is a tree-path walk plus a
+/// Beta update, no model/network I/O -- same reasoning as
+/// `integrity_verify_handler`.
+async fn bandit_feedback_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<BanditFeedbackRequest>,
+) -> Result<Json<BanditFeedbackResponse>, (StatusCode, String)> {
+    let mut corpus = state.corpus.lock().unwrap();
+    let (alpha, beta) = corpus.bandit_feedback(req.key, req.reward).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            "no active Bandit Arena session, or that record key is no longer live -- run a \
+             query first"
+                .to_string(),
+        )
+    })?;
+    Ok(Json(BanditFeedbackResponse { alpha, beta }))
+}
+
 async fn index_handler(State(state): State<Arc<AppState>>) -> Html<String> {
     let total_records = state.corpus.lock().unwrap().db.len();
     Html(render_index_html(total_records))
@@ -1722,6 +2132,8 @@ async fn main() -> Result<()> {
         .route("/steering/search", post(steering_search_handler))
         .route("/graph/explore", post(graph_explore_handler))
         .route("/graph/walk", post(graph_walk_handler))
+        .route("/bandit/query", post(bandit_query_handler))
+        .route("/bandit/feedback", post(bandit_feedback_handler))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", PORT)).await?;
@@ -2481,6 +2893,301 @@ mod tests {
             biased_rate > plain_rate + 0.2,
             "a walk steered straight at a direct neighbor should land on it far more often \
              than a plain walk: biased_rate={biased_rate}, plain_rate={plain_rate}"
+        );
+    }
+
+    // Corpus::bandit_query / bandit_feedback (Issue #18, Bandit Arena)
+
+    #[test]
+    fn build_bandit_session_partitions_every_current_record_into_exactly_one_region() {
+        let seed = synthetic_records(25, 16);
+        let corpus = Corpus::seed(seed).expect("seed build should succeed");
+
+        let session = corpus.build_bandit_session();
+        let total_in_regions: usize = session
+            .region_counts
+            .iter()
+            .map(|(members, _)| members.len())
+            .sum();
+        assert_eq!(
+            total_in_regions,
+            corpus.db.len(),
+            "every currently-stored record should appear in exactly one region"
+        );
+
+        let mut all_members: Vec<u64> = session
+            .region_counts
+            .iter()
+            .flat_map(|(members, _)| members.iter().copied())
+            .collect();
+        all_members.sort_unstable();
+        all_members.dedup();
+        assert_eq!(
+            all_members.len(),
+            corpus.db.len(),
+            "no record should appear in more than one region"
+        );
+
+        assert!(
+            session.region_counts.iter().all(|(_, count)| *count == 0),
+            "a freshly built session should start every region's sample count at 0"
+        );
+    }
+
+    /// Three tight, well-separated dedicated-axis clusters of 15 records
+    /// each (dim 8, matching `bandit_region_config()`'s `pca_dim` default so
+    /// PCA is a no-op), plus one record on a 4th axis, alone, far from every
+    /// other point -- deterministically isolated into its own singleton
+    /// k-means bucket by `RegionTree::build`'s depth-0 split under
+    /// `bandit_region_config()` (`branching_factor: 4` gives k-means a spare
+    /// cluster to spend entirely on the one outlier). Confirmed by hand
+    /// against `RegionTree::build`/`region_members` directly: without
+    /// `build_bandit_session`'s singleton-bucket repair, the outlier's
+    /// reported region is all 46 records, not just itself.
+    fn dedicated_axis_clusters_with_one_outlier() -> (Vec<(Vec<f32>, String)>, RecordKey) {
+        let dim = 8;
+        let mut records = Vec::new();
+        for cluster in 0..3usize {
+            for i in 0..15u64 {
+                let mut v = vec![0.01 * i as f32; dim];
+                v[cluster] += 10.0;
+                records.push((v, format!("cluster-{cluster}-{i}")));
+            }
+        }
+        let mut outlier = vec![0.0f32; dim];
+        outlier[3] = 100.0;
+        let outlier_key = RecordKey(records.len() as u64);
+        records.push((outlier, "outlier".to_string()));
+        (records, outlier_key)
+    }
+
+    /// Pins the fix for the `RegionTree::region_members` singleton-bucket
+    /// edge case documented on `build_bandit_session`: on a corpus that
+    /// deterministically triggers it, the outlier's region must be just
+    /// itself, and the partition-completeness invariant (every record in
+    /// exactly one region) must still hold -- unlike
+    /// `build_bandit_session_partitions_every_current_record_into_exactly_one_region`
+    /// above, which passes on a corpus that never happens to trigger this
+    /// edge case at all, and so wouldn't have caught a regression here.
+    #[test]
+    fn build_bandit_session_gives_an_isolated_outlier_its_own_singleton_region() {
+        let (records, outlier_key) = dedicated_axis_clusters_with_one_outlier();
+        let corpus = Corpus::seed(records).expect("seed build should succeed");
+        let outlier_id = *corpus.key_to_id.get(&outlier_key).unwrap();
+
+        let session = corpus.build_bandit_session();
+        let outlier_region = session
+            .region_counts
+            .iter()
+            .find(|(members, _)| members.contains(&outlier_id))
+            .map(|(members, _)| members.clone())
+            .expect("the outlier should appear in exactly one region");
+        assert_eq!(
+            outlier_region,
+            vec![outlier_id],
+            "an isolated record's region should be just itself, not the whole tree"
+        );
+
+        let total_in_regions: usize = session
+            .region_counts
+            .iter()
+            .map(|(members, _)| members.len())
+            .sum();
+        assert_eq!(total_in_regions, corpus.db.len());
+        let mut all_members: Vec<u64> = session
+            .region_counts
+            .iter()
+            .flat_map(|(members, _)| members.iter().copied())
+            .collect();
+        all_members.sort_unstable();
+        all_members.dedup();
+        assert_eq!(all_members.len(), corpus.db.len());
+    }
+
+    #[test]
+    fn bandit_query_lazily_builds_a_session_and_ranks_the_sampled_region_by_similarity() {
+        let seed = synthetic_records(25, 16);
+        let mut corpus = Corpus::seed(seed).expect("seed build should succeed");
+        assert!(corpus.bandit_session.is_none());
+
+        let query = corpus.records[0].embedding.clone();
+        let result = corpus.bandit_query(&query);
+
+        assert!(corpus.bandit_session.is_some());
+        assert!(!result.candidates.is_empty());
+        assert_eq!(result.step, 1);
+        // The sampled region's own count (somewhere in `regions`) should
+        // have been incremented to 1, and every other region should still
+        // read 0 -- this is the very first cycle.
+        let counts: Vec<usize> = result.regions.iter().map(|r| r.sample_count).collect();
+        assert_eq!(counts.iter().sum::<usize>(), 1);
+
+        // Descending by score.
+        for pair in result.candidates.windows(2) {
+            assert!(pair[0].score >= pair[1].score);
+        }
+    }
+
+    #[test]
+    fn bandit_query_seeds_every_region_at_zero_before_any_cycle_has_sampled_it() {
+        let seed = synthetic_records(25, 16);
+        let mut corpus = Corpus::seed(seed).expect("seed build should succeed");
+        let query = corpus.records[0].embedding.clone();
+
+        let result = corpus.bandit_query(&query);
+        let session = corpus.bandit_session.as_ref().unwrap();
+        assert_eq!(
+            result.regions.len(),
+            session.region_counts.len(),
+            "the live view should report every region in the session, not just sampled ones"
+        );
+    }
+
+    #[test]
+    fn bandit_feedback_updates_the_observed_records_belief_and_leaves_others_untouched() {
+        let seed = synthetic_records(25, 16);
+        let mut corpus = Corpus::seed(seed).expect("seed build should succeed");
+        let query = corpus.records[0].embedding.clone();
+        let result = corpus.bandit_query(&query);
+        let observed_key = result.candidates[0].key;
+
+        let (alpha_before, beta_before) = {
+            let session = corpus.bandit_session.as_ref().unwrap();
+            let id = *corpus.key_to_id.get(&observed_key).unwrap();
+            session.tree.leaf_belief(id).unwrap()
+        };
+
+        for _ in 0..10 {
+            let belief = corpus.bandit_feedback(observed_key, 1.0);
+            assert!(belief.is_some());
+        }
+
+        let (alpha_after, beta_after) = corpus
+            .bandit_session
+            .as_ref()
+            .unwrap()
+            .tree
+            .leaf_belief(*corpus.key_to_id.get(&observed_key).unwrap())
+            .unwrap();
+        assert!(alpha_after > alpha_before + 5.0);
+        assert_eq!(
+            beta_after, beta_before,
+            "an all-positive reward shouldn't move beta"
+        );
+    }
+
+    #[test]
+    fn bandit_feedback_is_none_without_an_active_session() {
+        let seed = synthetic_records(5, 16);
+        let mut corpus = Corpus::seed(seed).expect("seed build should succeed");
+        assert!(corpus.bandit_session.is_none());
+        let key = corpus.records[0].key;
+        assert_eq!(corpus.bandit_feedback(key, 1.0), None);
+    }
+
+    #[test]
+    fn bandit_feedback_is_none_for_a_key_that_was_never_issued() {
+        let seed = synthetic_records(5, 16);
+        let mut corpus = Corpus::seed(seed).expect("seed build should succeed");
+        let query = corpus.records[0].embedding.clone();
+        corpus.bandit_query(&query);
+        assert_eq!(corpus.bandit_feedback(RecordKey(9999), 1.0), None);
+    }
+
+    #[test]
+    fn ingest_drops_the_bandit_session_and_the_next_query_starts_a_fresh_one() {
+        let seed = synthetic_records(20, 16);
+        let mut corpus = Corpus::seed(seed).expect("seed build should succeed");
+        let query = corpus.records[0].embedding.clone();
+        let first = corpus.bandit_query(&query);
+        assert_eq!(first.step, 1);
+
+        let more = synthetic_records(10, 16)
+            .into_iter()
+            .map(|(v, _)| (v, "new-doc".to_string()))
+            .collect();
+        corpus
+            .ingest(more)
+            .expect("ingest should succeed and should not panic despite an active session");
+        assert!(
+            corpus.bandit_session.is_none(),
+            "rebuild() (via ingest) should drop the old session rather than try to patch it"
+        );
+
+        let after_ingest = corpus.bandit_query(&query);
+        assert_eq!(
+            after_ingest.step, 1,
+            "a freshly (re)built session's own step counter should restart at 1"
+        );
+        let total_in_regions: usize = after_ingest.regions.iter().map(|r| r.keys.len()).sum();
+        assert_eq!(
+            total_in_regions,
+            corpus.db.len(),
+            "the fresh post-ingest session should cover every record in the grown corpus"
+        );
+    }
+
+    /// Issue #18's acceptance criterion: repeated positive feedback on
+    /// records from one region should measurably shift `RegionTree::
+    /// sample()`'s later picks toward that region, compared to a fresh,
+    /// unlearned baseline session over the same corpus -- exercised through
+    /// `Corpus::bandit_query`/`bandit_feedback` (not `RegionTree` directly,
+    /// which `src/bandit.rs`'s own `repeated_sample_observe_converges_
+    /// toward_the_more_rewarding_cluster` already pins), so this test also
+    /// covers this file's own plumbing: id -> region -> ranked candidates ->
+    /// feedback -> belief update -> a later `sample()` call.
+    ///
+    /// Four dedicated-axis clusters (same construction as `src/bandit.rs`'s
+    /// own convergence test) at `dim == 8`, matching `bandit_region_config()`'s
+    /// `pca_dim` default -- so `RegionTree::build`'s PCA step is a no-op
+    /// (`dim > pca_target` is false) and k-means, with the demo's actual
+    /// `branching_factor: 4`, clusters directly on the axes each cluster was
+    /// built to dominate. The test doesn't assume a clean one-region-per-
+    /// cluster split, though (k-means over real data is never guaranteed
+    /// that neatly) -- it only ever asks "did whichever record got sampled
+    /// belong to cluster 0", which is exactly the causal claim being tested
+    /// regardless of how the tree happened to carve up its regions.
+    #[test]
+    fn bandit_repeated_positive_feedback_shifts_sample_share_toward_the_rewarded_cluster() {
+        let clustered = synthetic_clustered_records(4, 15, 8);
+        let seed_records: Vec<(Vec<f32>, String)> = clustered
+            .iter()
+            .map(|(v, _, m)| (v.clone(), m.clone()))
+            .collect();
+        let cluster_of_key: HashMap<RecordKey, usize> = (0..clustered.len())
+            .map(|i| (RecordKey(i as u64), clustered[i].1))
+            .collect();
+
+        let n_trials: u64 = 300;
+        let warmup = n_trials / 2;
+        let probe = vec![0.0f32; 8];
+
+        let run = |with_learning: bool| -> f32 {
+            let mut corpus = Corpus::seed(seed_records.clone()).expect("seed build should succeed");
+            let mut hits = 0u32;
+            for step in 0..n_trials {
+                let result = corpus.bandit_query(&probe);
+                let top_key = result.candidates[0].key;
+                let cluster = cluster_of_key[&top_key];
+                if with_learning {
+                    let reward = if cluster == 0 { 1.0 } else { 0.0 };
+                    corpus.bandit_feedback(top_key, reward);
+                }
+                if step >= warmup && cluster == 0 {
+                    hits += 1;
+                }
+            }
+            hits as f32 / (n_trials - warmup) as f32
+        };
+
+        let baseline_rate = run(false);
+        let learned_rate = run(true);
+
+        assert!(
+            learned_rate > baseline_rate + 0.2,
+            "expected repeated positive feedback through Corpus::bandit_query/bandit_feedback \
+             to beat a fresh no-feedback baseline by a solid margin: learned_rate={learned_rate}, \
+             baseline_rate={baseline_rate}"
         );
     }
 }

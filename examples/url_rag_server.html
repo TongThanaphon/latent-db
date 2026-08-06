@@ -36,6 +36,12 @@
   .class-group h3 { font-size: 0.9rem; margin: 0 0 0.4rem; color: #555; }
   .class-group ul { margin: 0; }
   .class-group li { border-color: #eee; }
+  .bandit-feedback { margin-top: 0.4rem; display: flex; align-items: center; gap: 0.5rem; }
+  .bandit-feedback button { padding: 0.15rem 0.5rem; font-size: 1rem; }
+  .bandit-region-label { font-size: 0.85rem; color: #444; margin-bottom: 0.2rem; }
+  .bandit-region-bar { background: #eee; border-radius: 4px; height: 0.6rem; overflow: hidden; }
+  .bandit-region-fill { background: #4c6ef5; height: 100%; }
+  #bandit-regions li { border: none; padding: 0.4rem 0; }
 </style>
 </head>
 <body>
@@ -49,6 +55,7 @@
   <button class="tab-btn" data-tab="boundary-classes" type="button">Boundary Classes</button>
   <button class="tab-btn" data-tab="steering" type="button">Steering</button>
   <button class="tab-btn" data-tab="graph-explorer" type="button">Graph Explorer</button>
+  <button class="tab-btn" data-tab="bandit-arena" type="button">Bandit Arena</button>
 </nav>
 
 <section id="tab-ingest" class="tab-panel active">
@@ -191,6 +198,26 @@
       <div class="ranking"><h3>Steered weighted_random_walk()</h3><ul id="graph-biased-walk"></ul></div>
     </div>
   </div>
+</section>
+
+<section id="tab-bandit-arena" class="tab-panel">
+  <p class="hint">Builds a <code>RegionTree</code> over every currently stored record and starts a
+    session. Each search types a query, Thompson-samples a <em>region</em> via
+    <code>RegionTree::sample()</code> (independent of the query text -- only the belief history
+    decides which region gets picked), then ranks that region's own records against the query.
+    Click &#128077;/&#128078; on any result to feed a reward into <code>RegionTree::observe()</code>
+    for that record -- since every result shown shares the sampled region, rewarding any one of
+    them shifts that whole region's belief. Repeat a few times, always favoring the same region's
+    results, and watch its share of the sample-count list below grow against the others. An ingest
+    elsewhere starts a brand new session (a rebuilt tree can't safely reuse old belief state).</p>
+  <form id="bandit-form">
+    <input id="bandit-query" type="text" placeholder="sleep exercise diet" />
+    <button id="bandit-button" type="submit">Search</button>
+  </form>
+  <p id="bandit-status" class="hint"></p>
+  <ul id="bandit-candidates"></ul>
+  <h3>Sample counts by region (this session)</h3>
+  <ul id="bandit-regions"></ul>
 </section>
 
 <script type="module">
@@ -680,6 +707,108 @@ graphForm.addEventListener("submit", async (e) => {
 
 graphAlphaInput.addEventListener("input", () => {
   graphAlphaValueEl.textContent = Number(graphAlphaInput.value).toFixed(2);
+});
+
+// Bandit Arena tab (Issue #18): each search Thompson-samples a region via
+// RegionTree::sample() (the server's Corpus::bandit_query) and ranks that
+// region's own records against the query; a thumbs up/down on any rendered
+// result feeds RegionTree::observe() (Corpus::bandit_feedback) for that
+// specific record. Sample counts are shown per region as proportional bars
+// -- no chart library, same idiom as the page's own .stats/.class-group.
+const banditForm = document.getElementById("bandit-form");
+const banditQueryInput = document.getElementById("bandit-query");
+const banditButton = document.getElementById("bandit-button");
+const banditStatusEl = document.getElementById("bandit-status");
+const banditCandidatesEl = document.getElementById("bandit-candidates");
+const banditRegionsEl = document.getElementById("bandit-regions");
+
+// Routes through `submitJsonForm`, same as every other tab's POST -- the
+// clicked thumbs button is `button` (disabled for the request's duration,
+// so a rapid double-click can't fire two `observe()` calls for one click)
+// and the row's own `.belief` span is `messageEl`.
+function sendBanditFeedback(key, reward, button, messageEl) {
+  return submitJsonForm({
+    endpoint: "/bandit/feedback",
+    body: { key, reward },
+    button,
+    messageEl,
+    pendingText: "Recording feedback...",
+    onSuccess: (result) => {
+      messageEl.textContent = `belief: alpha=${result.alpha.toFixed(2)}, beta=${result.beta.toFixed(2)}`;
+    },
+  });
+}
+
+// Reuses `renderRecordRow` for the base row (key + score header + Verify
+// button + metadata text, same as every other tab's list), then appends a
+// thumbs up/down control -- rather than hand-rolling the row's markup a
+// second time.
+function renderBanditCandidates(listEl, candidates) {
+  listEl.innerHTML = "";
+  if (!candidates || candidates.length === 0) {
+    listEl.innerHTML = "<li>No records in this region.</li>";
+    return;
+  }
+  for (const c of candidates) {
+    const scoreHtml = `<span class="score">score=${c.score.toFixed(4)}</span> `;
+    const li = renderRecordRow(c.key, c.metadata, scoreHtml);
+
+    const feedback = document.createElement("div");
+    feedback.className = "bandit-feedback";
+    feedback.innerHTML =
+      `<button type="button" class="thumbs-up">&#128077;</button>` +
+      `<button type="button" class="thumbs-down">&#128078;</button>` +
+      `<span class="belief hint"></span>`;
+    const beliefEl = feedback.querySelector(".belief");
+    const upButton = feedback.querySelector(".thumbs-up");
+    const downButton = feedback.querySelector(".thumbs-down");
+    upButton.addEventListener("click", () => sendBanditFeedback(c.key, 1.0, upButton, beliefEl));
+    downButton.addEventListener("click", () => sendBanditFeedback(c.key, 0.0, downButton, beliefEl));
+    li.appendChild(feedback);
+
+    listEl.appendChild(li);
+  }
+}
+
+// Every region the tree has, in the server's fixed order, each starting at
+// sample_count 0 -- so a region a viewer hasn't been steered toward yet is
+// still visible as a bar of length 0, not simply missing from the list.
+function renderBanditRegions(listEl, regions) {
+  listEl.innerHTML = "";
+  if (!regions || regions.length === 0) {
+    listEl.innerHTML = "<li>No regions yet.</li>";
+    return;
+  }
+  const maxCount = Math.max(1, ...regions.map((r) => r.sample_count));
+  regions.forEach((r, i) => {
+    const li = document.createElement("li");
+    const pct = (r.sample_count / maxCount) * 100;
+    li.innerHTML =
+      `<div class="bandit-region-label">region ${i + 1} (${r.keys.length} record(s), keys ${r.keys.join(", ")}): ` +
+      `${r.sample_count} sample(s)</div>` +
+      `<div class="bandit-region-bar"><div class="bandit-region-fill" style="width:${pct}%"></div></div>`;
+    listEl.appendChild(li);
+  });
+}
+
+banditForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const query = banditQueryInput.value.trim();
+  if (!query) return;
+
+  await submitJsonForm({
+    endpoint: "/bandit/query",
+    body: { query },
+    button: banditButton,
+    messageEl: banditStatusEl,
+    pendingText: "Sampling a region and searching within it...",
+    onSuccess: (result) => {
+      renderBanditCandidates(banditCandidatesEl, result.candidates);
+      renderBanditRegions(banditRegionsEl, result.regions);
+      banditStatusEl.textContent =
+        `cycle ${result.step}: sampled a region with ${result.candidates.length} record(s).`;
+    },
+  });
 });
 </script>
 </body>
