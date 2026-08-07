@@ -200,9 +200,11 @@ fn main() {
     // sections run) *before* the eviction demo in section 10 -- eviction
     // removes records, and we want the steering/graph demos to see the
     // full, un-thinned corpus.
-    let id_to_topic: HashMap<u64, usize> = ids.iter().copied().zip(topics.iter().copied()).collect();
-    let topic_centers: Vec<Vec<f32>> =
-        (0..n_topics).map(|t| topic_centroid(&corpus, &topics, t, DIM)).collect();
+    let id_to_topic: HashMap<u64, usize> =
+        ids.iter().copied().zip(topics.iter().copied()).collect();
+    let topic_centers: Vec<Vec<f32>> = (0..n_topics)
+        .map(|t| topic_centroid(&corpus, &topics, t, DIM))
+        .collect();
 
     section("8. Latent Field Steering: bias a query toward a topic axis");
     let (topic_a, topic_b) = (0usize, 1usize);
@@ -251,7 +253,9 @@ fn main() {
         let d0 = euclidean(v, &topic_centers[0]);
         (0..n_topics).all(|t| t == 0 || euclidean(v, &topic_centers[t]) >= d0)
     };
-    let graph = db.build_viable_graph(predicate, /* k_nearest */ 4, /* edge_midpoint_check */ false);
+    let graph = db.build_viable_graph(
+        predicate, /* k_nearest */ 4, /* edge_midpoint_check */ false,
+    );
     println!(
         "predicate: 'nearest topic centroid is topic 0' -> kept {} of {} records as graph nodes, {} edges",
         graph.n_nodes(),
@@ -271,7 +275,9 @@ fn main() {
                 "geodesic({a}, {b}): {} hops, staying within the topic-0 neighborhood",
                 path.len() - 1
             ),
-            None => println!("geodesic({a}, {b}): unreachable (topic-0 subset split into separate components)"),
+            None => println!(
+                "geodesic({a}, {b}): unreachable (topic-0 subset split into separate components)"
+            ),
         }
 
         let walk = graph.random_walk(a, 10, 42);

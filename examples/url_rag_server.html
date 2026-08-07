@@ -1,0 +1,815 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>latent-db URL RAG demo</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 3rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.25rem; }
+  #status { color: #666; font-size: 0.9rem; margin-bottom: 1.5rem; }
+  nav.tabs { display: flex; gap: 0.25rem; border-bottom: 1px solid #ddd; margin-bottom: 1.5rem; }
+  nav.tabs button { padding: 0.5rem 1rem; font-size: 0.95rem; border: none; background: none; cursor: pointer; border-bottom: 2px solid transparent; }
+  nav.tabs button.active { border-bottom-color: #333; font-weight: 600; }
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
+  form { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+  input[type=text] { flex: 1; min-width: 14rem; padding: 0.5rem; font-size: 1rem; }
+  button { padding: 0.5rem 1rem; font-size: 1rem; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  ul { list-style: none; padding: 0; }
+  li { padding: 0.6rem; border: 1px solid #ddd; border-radius: 6px; margin: 0.4rem 0; }
+  .key { color: #888; font-size: 0.8rem; display: flex; align-items: center; gap: 0.5rem; }
+  .verify-link { padding: 0.1rem 0.5rem; font-size: 0.75rem; }
+  .hint { color: #888; font-size: 0.85rem; margin: 0.5rem 0; }
+  .error { color: #b00020; }
+  .rankings { display: flex; gap: 1rem; flex-wrap: wrap; }
+  .ranking { flex: 1; min-width: 16rem; }
+  .ranking h3 { font-size: 1rem; margin-bottom: 0.4rem; }
+  .score { color: #888; font-size: 0.8rem; }
+  .stats { list-style: none; padding: 0; margin: 0 0 1rem; }
+  .stats li { padding: 0.5rem 0; border-bottom: 1px solid #eee; }
+  .stats code { word-break: break-all; }
+  .verify-result { font-weight: 600; }
+  .verify-result.verified { color: #0a7d2c; }
+  .verify-result.unverified { color: #b00020; }
+  .class-group { border: 1px solid #ddd; border-radius: 6px; margin: 0.6rem 0; padding: 0.6rem 0.8rem; border-left: 4px solid var(--class-color, #888); }
+  .class-group h3 { font-size: 0.9rem; margin: 0 0 0.4rem; color: #555; }
+  .class-group ul { margin: 0; }
+  .class-group li { border-color: #eee; }
+  .bandit-feedback { margin-top: 0.4rem; display: flex; align-items: center; gap: 0.5rem; }
+  .bandit-feedback button { padding: 0.15rem 0.5rem; font-size: 1rem; }
+  .bandit-region-label { font-size: 0.85rem; color: #444; margin-bottom: 0.2rem; }
+  .bandit-region-bar { background: #eee; border-radius: 4px; height: 0.6rem; overflow: hidden; }
+  .bandit-region-fill { background: #4c6ef5; height: 100%; }
+  #bandit-regions li { border: none; padding: 0.4rem 0; }
+</style>
+</head>
+<body>
+<h1>latent-db URL RAG demo</h1>
+<p id="status">__TOTAL_RECORDS__ records loaded.</p>
+
+<nav class="tabs">
+  <button class="tab-btn active" data-tab="ingest" type="button">Ingest</button>
+  <button class="tab-btn" data-tab="search" type="button">Search</button>
+  <button class="tab-btn" data-tab="integrity" type="button">Integrity</button>
+  <button class="tab-btn" data-tab="boundary-classes" type="button">Boundary Classes</button>
+  <button class="tab-btn" data-tab="steering" type="button">Steering</button>
+  <button class="tab-btn" data-tab="graph-explorer" type="button">Graph Explorer</button>
+  <button class="tab-btn" data-tab="bandit-arena" type="button">Bandit Arena</button>
+</nav>
+
+<section id="tab-ingest" class="tab-panel active">
+  <p class="hint">Paste an English article URL. The server fetches it, extracts the readable
+    text, splits it into token-budgeted chunks, embeds each chunk with MiniLM, and folds it
+    into the accumulating <code>LatentDb</code> (re-ingesting the same URL will not grow the
+    record count -- content-hash dedup collapses the repeat chunks).</p>
+  <form id="ingest-form">
+    <input id="ingest-url" type="text" placeholder="https://example.com/some-article" />
+    <button id="ingest-button" type="submit">Ingest</button>
+  </form>
+  <p id="ingest-status" class="hint"></p>
+  <ul id="ingest-chunks"></ul>
+</section>
+
+<section id="tab-search" class="tab-panel">
+  <p class="hint">Type a free-text query and compare plain vector search against
+    <code>search_blended()</code>, which fuses the same vector ranking with a lexical
+    term-overlap ranking over the query's own words. The two score columns aren't on the same
+    scale (cosine similarity vs. Reciprocal Rank Fusion) -- compare rank order, not the numbers.</p>
+  <form id="search-form">
+    <input id="search-query" type="text" placeholder="sleep exercise diet" />
+    <button id="search-button" type="submit">Search</button>
+  </form>
+  <p id="search-status" class="hint"></p>
+  <div class="rankings">
+    <div class="ranking">
+      <h3>Vector search()</h3>
+      <ul id="search-vector-results"></ul>
+    </div>
+    <div class="ranking">
+      <h3>Blended search_blended()</h3>
+      <ul id="search-blended-results"></ul>
+    </div>
+  </div>
+</section>
+
+<section id="tab-integrity" class="tab-panel">
+  <p class="hint">The current PQ compression ratio and Merkle root over every stored record,
+    refreshed after each ingest. Click <strong>Verify</strong> next to any record in the Ingest
+    or Search tabs -- or paste a <code>key</code> below -- to fetch a fresh
+    <code>merkle_proof()</code> for it and check it against the current root -- this works even
+    right after another ingest rebuilt the tree, since the proof and the root it's checked
+    against are always read together and the root actually used is what gets shown below.</p>
+  <ul class="stats">
+    <li>Compression ratio: <strong id="integrity-ratio">&hellip;</strong></li>
+    <li>Merkle root: <code id="integrity-root">&hellip;</code></li>
+  </ul>
+  <form id="verify-form">
+    <input id="verify-key" type="number" min="0" step="1" placeholder="record key, e.g. 3" />
+    <button id="verify-button" type="submit">Verify</button>
+  </form>
+  <p id="verify-status" class="hint"></p>
+</section>
+
+<section id="tab-boundary-classes" class="tab-panel">
+  <p class="hint">Builds a <code>ViableGraph</code> over every currently stored record (predicate:
+    accept all) and partitions it with <code>boundary_classes()</code> -- a <em>structural</em>
+    equivalence over the kNN graph's shape, not a similarity clustering, so records only share a
+    class when their local neighborhoods are indistinguishable, not merely "close". Records
+    grouped alone in a class of one are shown too, so the full partition is visible.</p>
+  <p id="boundary-classes-status" class="hint"></p>
+  <div id="boundary-classes-groups"></div>
+</section>
+
+<section id="tab-steering" class="tab-panel">
+  <p class="hint">Pick two records by key (e.g. from a Search or Boundary Classes result) to
+    define a concept direction -- the server builds a <code>SteeringVector</code> pointing from
+    record A's embedding toward record B's, unit-normalized. Type a query and click Compare, then
+    drag the alpha slider: it re-runs <code>search_steered()</code> live against the same query,
+    so the right-hand column visibly re-ranks toward B's concept as alpha increases, next to
+    plain <code>search()</code> on the left for comparison.</p>
+  <form id="steering-form">
+    <input id="steering-key-a" type="number" min="0" step="1" placeholder="record A key" />
+    <input id="steering-key-b" type="number" min="0" step="1" placeholder="record B key" />
+    <input id="steering-query" type="text" placeholder="sleep exercise diet" />
+    <button id="steering-button" type="submit">Compare</button>
+  </form>
+  <p class="hint">
+    alpha = <strong id="steering-alpha-value">0.50</strong>
+    <input id="steering-alpha" type="range" min="0" max="1" step="0.05" value="0.5" disabled />
+  </p>
+  <p id="steering-status" class="hint"></p>
+  <p id="steering-vector" class="hint"></p>
+  <div class="rankings">
+    <div class="ranking">
+      <h3>Plain search()</h3>
+      <ul id="steering-plain-results"></ul>
+    </div>
+    <div class="ranking">
+      <h3>Steered search_steered()</h3>
+      <ul id="steering-steered-results"></ul>
+    </div>
+  </div>
+</section>
+
+<section id="tab-graph-explorer" class="tab-panel">
+  <p class="hint">Pick two records by key (e.g. from Search or Boundary Classes) to build a
+    <code>ViableGraph</code> over every currently stored record (predicate: accept all).
+    <strong>Path</strong> shows <code>geodesic(A, B)</code> plus <code>trajectory::path_geometry()</code>'s
+    length/curvature over it, and a <code>bifurcation_ratio()</code> against a same-length comparison
+    walk anchored one hop into that path (not at A itself -- see the status line if the numbers look
+    odd for two identical picks). <strong>Walk</strong> instead runs a <code>weighted_random_walk()</code>
+    from A, biased by the same kind of <code>SteeringVector</code> Steering builds (pointing A toward B),
+    next to a plain uniform <code>random_walk()</code> from the same start.</p>
+  <form id="graph-form">
+    <input id="graph-key-a" type="number" min="0" step="1" placeholder="record A key (start)" />
+    <input id="graph-key-b" type="number" min="0" step="1" placeholder="record B key (end)" />
+    <input id="graph-seed" type="number" min="0" step="1" value="42" placeholder="seed" />
+    <input id="graph-steps" type="number" min="1" max="60" value="10" placeholder="steps (Walk mode)" />
+    <button id="graph-button" type="submit">Explore</button>
+  </form>
+  <p class="hint">
+    <label><input type="radio" name="graph-mode" value="path" checked /> Path (geodesic + bifurcation)</label>
+    &nbsp; &nbsp;
+    <label><input type="radio" name="graph-mode" value="walk" /> Walk (steered vs. plain)</label>
+    &nbsp; &nbsp;
+    <span id="graph-alpha-row" style="display:none">
+      alpha = <strong id="graph-alpha-value">1.00</strong>
+      <input id="graph-alpha" type="range" min="0" max="1" step="0.05" value="1" />
+    </span>
+  </p>
+  <p id="graph-status" class="hint"></p>
+  <p id="graph-stats" class="hint"></p>
+
+  <div id="graph-path-view">
+    <h3>Geodesic path (<span id="graph-hops">0</span> hop(s))</h3>
+    <ul id="graph-path-list"></ul>
+    <p id="graph-geometry" class="hint"></p>
+    <h3>Comparison walk (same length, anchored one hop in -- not at A)</h3>
+    <ul id="graph-comparison-list"></ul>
+    <p id="graph-comparison-geometry" class="hint"></p>
+    <p id="graph-bifurcation" class="hint"></p>
+  </div>
+
+  <div id="graph-walk-view" style="display:none">
+    <p id="graph-steering-vector" class="hint"></p>
+    <div class="rankings">
+      <div class="ranking"><h3>Plain random_walk()</h3><ul id="graph-plain-walk"></ul></div>
+      <div class="ranking"><h3>Steered weighted_random_walk()</h3><ul id="graph-biased-walk"></ul></div>
+    </div>
+  </div>
+</section>
+
+<section id="tab-bandit-arena" class="tab-panel">
+  <p class="hint">Builds a <code>RegionTree</code> over every currently stored record and starts a
+    session. Each search types a query, Thompson-samples a <em>region</em> via
+    <code>RegionTree::sample()</code> (independent of the query text -- only the belief history
+    decides which region gets picked), then ranks that region's own records against the query.
+    Click &#128077;/&#128078; on any result to feed a reward into <code>RegionTree::observe()</code>
+    for that record -- since every result shown shares the sampled region, rewarding any one of
+    them shifts that whole region's belief. Repeat a few times, always favoring the same region's
+    results, and watch its share of the sample-count list below grow against the others. An ingest
+    elsewhere starts a brand new session (a rebuilt tree can't safely reuse old belief state).</p>
+  <form id="bandit-form">
+    <input id="bandit-query" type="text" placeholder="sleep exercise diet" />
+    <button id="bandit-button" type="submit">Search</button>
+  </form>
+  <p id="bandit-status" class="hint"></p>
+  <ul id="bandit-candidates"></ul>
+  <h3>Sample counts by region (this session)</h3>
+  <ul id="bandit-regions"></ul>
+</section>
+
+<script type="module">
+// Generic tab-shell wiring: later tabs (Steering, Graph Explorer, Bandit
+// Arena) just add a `.tab-btn[data-tab=...]` + `#tab-<name>.tab-panel` pair
+// -- no changes needed here.
+const tabButtons = document.querySelectorAll(".tab-btn");
+const tabPanels = document.querySelectorAll(".tab-panel");
+tabButtons.forEach((btn) => {
+  btn.addEventListener("click", () => {
+    tabButtons.forEach((b) => b.classList.remove("active"));
+    tabPanels.forEach((p) => p.classList.remove("active"));
+    btn.classList.add("active");
+    document.getElementById(`tab-${btn.dataset.tab}`).classList.add("active");
+  });
+});
+
+const statusEl = document.getElementById("status");
+
+// Shared POST-JSON submit flow: disable `button`, show `pendingText` in
+// `messageEl`, fetch `endpoint` with `body`, hand the parsed response to
+// `onSuccess`, and on failure show a readable error -- always re-enabling
+// `button` after. Later tabs with a form-driven POST (Steering, Graph
+// Explorer) are expected to follow this same request shape, so they route
+// through this instead of re-pasting the fetch/error/disable boilerplate a
+// third time. A tab with no request body and no button to disable (like
+// Boundary Classes' `fetchBoundaryClasses` below) follows `fetchIntegrity`'s
+// plain-GET shape instead.
+async function submitJsonForm({ endpoint, body, button, messageEl, pendingText, onSuccess }) {
+  button.disabled = true;
+  messageEl.classList.remove("error");
+  messageEl.textContent = pendingText;
+  try {
+    const resp = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok) {
+      // Error responses are plain text (see `(StatusCode, String)` in the
+      // server), not JSON.
+      const text = await resp.text();
+      throw new Error(text || `request failed with status ${resp.status}`);
+    }
+    onSuccess(await resp.json());
+  } catch (err) {
+    messageEl.classList.add("error");
+    messageEl.textContent = `Error: ${err.message}`;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+// Integrity tab elements + the verify flow, wired before Ingest/Search
+// below so their result lists can attach a per-record "Verify" button that
+// reuses this same flow -- Issue #14 wants verification to be something a
+// viewer clicks, not a key they have to copy into a separate box.
+const integrityRatioEl = document.getElementById("integrity-ratio");
+const integrityRootEl = document.getElementById("integrity-root");
+const verifyForm = document.getElementById("verify-form");
+const verifyKeyInput = document.getElementById("verify-key");
+const verifyButton = document.getElementById("verify-button");
+const verifyStatusEl = document.getElementById("verify-status");
+
+// GET, not `submitJsonForm` (no request body, no button to disable) --
+// called once on page load and again after every successful ingest, so the
+// Integrity tab is current the moment a viewer opens it.
+async function fetchIntegrity() {
+  try {
+    const resp = await fetch("/integrity");
+    if (!resp.ok) throw new Error(await resp.text());
+    const result = await resp.json();
+    integrityRatioEl.textContent = `${result.compression_ratio.toFixed(2)}x`;
+    integrityRootEl.textContent = result.merkle_root;
+  } catch (err) {
+    integrityRatioEl.textContent = "error";
+    integrityRootEl.textContent = `Error: ${err.message}`;
+  }
+}
+
+// Verifies `key` and switches to the Integrity tab so the result is visible
+// regardless of whether the click came from this tab's own form or a
+// per-record "Verify" button in Ingest/Search. The message quotes
+// `result.merkle_root` -- the exact root the server checked `key` against
+// (see `VerifyResponse` in the server) -- rather than `integrityRootEl`'s
+// last-fetched value, so it can never show a root that's gone stale
+// relative to what was actually verified.
+async function runVerify(key) {
+  verifyKeyInput.value = key;
+  document.querySelector('.tab-btn[data-tab="integrity"]').click();
+
+  verifyStatusEl.classList.remove("verify-result", "verified", "unverified");
+  await submitJsonForm({
+    endpoint: "/integrity/verify",
+    body: { key },
+    button: verifyButton,
+    messageEl: verifyStatusEl,
+    pendingText: "Building proof and verifying...",
+    onSuccess: (result) => {
+      verifyStatusEl.classList.add("verify-result", result.verified ? "verified" : "unverified");
+      verifyStatusEl.textContent = result.verified
+        ? `Verified: key ${key} is included under Merkle root ${result.merkle_root}.`
+        : `Not verified: key ${key}'s proof did not match Merkle root ${result.merkle_root}.`;
+    },
+  });
+}
+
+// Builds one `<li>` for a record shown anywhere (Ingest's chunk list,
+// Search's hit lists, Boundary Classes' groups): a `key=` + Verify-button
+// header (wired to `runVerify`) followed by its text. `extraHeaderHtml`
+// slots in extra header content specific to that list -- e.g. Search's
+// score -- between the key and the Verify button.
+function renderRecordRow(key, text, extraHeaderHtml = "") {
+  const li = document.createElement("li");
+  li.innerHTML =
+    `<div class="key">key=${key} ${extraHeaderHtml}<button type="button" class="verify-link">Verify</button></div>${text}`;
+  li.querySelector(".verify-link").addEventListener("click", () => runVerify(key));
+  return li;
+}
+
+verifyForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const key = verifyKeyInput.value.trim();
+  if (key === "") return;
+  await runVerify(Number(key));
+});
+
+fetchIntegrity();
+
+// Boundary Classes tab: renders `boundary_classes()`'s partition as one
+// section per class, cycling a fixed palette by `class_id` so adjacent
+// classes are visually distinguishable -- purely cosmetic, the palette
+// carries no semantic meaning of its own. GET, not `submitJsonForm`, same
+// no-request-body/no-button reasoning as `fetchIntegrity`; called once on
+// page load and again after every successful ingest (see the ingest
+// handler below) so a rebuild's new partition is never stale on screen.
+const boundaryClassesStatusEl = document.getElementById("boundary-classes-status");
+const boundaryClassesGroupsEl = document.getElementById("boundary-classes-groups");
+const CLASS_COLORS = [
+  "#4c6ef5", "#f76707", "#2f9e44", "#e64980",
+  "#ae3ec9", "#1098ad", "#f08c00", "#495057",
+];
+
+async function fetchBoundaryClasses() {
+  try {
+    const resp = await fetch("/boundary-classes");
+    if (!resp.ok) throw new Error(await resp.text());
+    const result = await resp.json();
+
+    boundaryClassesGroupsEl.innerHTML = "";
+    let totalRecords = 0;
+    for (const group of result.groups) {
+      totalRecords += group.records.length;
+      const section = document.createElement("div");
+      section.className = "class-group";
+      section.style.setProperty("--class-color", CLASS_COLORS[group.class_id % CLASS_COLORS.length]);
+
+      const heading = document.createElement("h3");
+      const noun = group.records.length === 1 ? "record" : "records";
+      heading.textContent = `Class ${group.class_id} (${group.records.length} ${noun})`;
+      section.appendChild(heading);
+
+      const list = document.createElement("ul");
+      for (const record of group.records) {
+        list.appendChild(renderRecordRow(record.key, record.metadata));
+      }
+      section.appendChild(list);
+      boundaryClassesGroupsEl.appendChild(section);
+    }
+    boundaryClassesStatusEl.classList.remove("error");
+    boundaryClassesStatusEl.textContent = `${result.groups.length} class(es) over ${totalRecords} record(s).`;
+  } catch (err) {
+    boundaryClassesStatusEl.classList.add("error");
+    boundaryClassesStatusEl.textContent = `Error: ${err.message}`;
+  }
+}
+
+fetchBoundaryClasses();
+
+const form = document.getElementById("ingest-form");
+const urlInput = document.getElementById("ingest-url");
+const button = document.getElementById("ingest-button");
+const ingestStatusEl = document.getElementById("ingest-status");
+const chunksEl = document.getElementById("ingest-chunks");
+
+form.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const url = urlInput.value.trim();
+  if (!url) return;
+
+  chunksEl.innerHTML = "";
+  await submitJsonForm({
+    endpoint: "/ingest",
+    body: { url },
+    button,
+    messageEl: ingestStatusEl,
+    pendingText: "Fetching, extracting, embedding...",
+    onSuccess: (result) => {
+      ingestStatusEl.textContent =
+        `${result.chunks_added} chunk(s) processed (${result.net_new_records} net-new), ` +
+        `${result.total_records} total record(s) now.`;
+      statusEl.textContent = `${result.total_records} records loaded.`;
+      for (const chunk of result.chunks) {
+        chunksEl.appendChild(renderRecordRow(chunk.key, chunk.preview));
+      }
+      fetchIntegrity();
+      fetchBoundaryClasses();
+    },
+  });
+});
+
+const searchForm = document.getElementById("search-form");
+const searchQueryInput = document.getElementById("search-query");
+const searchButton = document.getElementById("search-button");
+const searchStatusEl = document.getElementById("search-status");
+const searchVectorEl = document.getElementById("search-vector-results");
+const searchBlendedEl = document.getElementById("search-blended-results");
+
+function renderHits(listEl, hits) {
+  listEl.innerHTML = "";
+  for (const hit of hits) {
+    const scoreHtml = `<span class="score">score=${hit.score.toFixed(4)}</span> `;
+    listEl.appendChild(renderRecordRow(hit.key, hit.metadata, scoreHtml));
+  }
+}
+
+searchForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const query = searchQueryInput.value.trim();
+  if (!query) return;
+
+  searchVectorEl.innerHTML = "";
+  searchBlendedEl.innerHTML = "";
+  await submitJsonForm({
+    endpoint: "/search",
+    body: { query },
+    button: searchButton,
+    messageEl: searchStatusEl,
+    pendingText: "Embedding and searching...",
+    onSuccess: (result) => {
+      renderHits(searchVectorEl, result.vector);
+      renderHits(searchBlendedEl, result.blended);
+      searchStatusEl.textContent = `${result.vector.length} vector hit(s), ${result.blended.length} blended hit(s).`;
+    },
+  });
+});
+
+// Steering tab (Issue #16): builds a SteeringVector from two picked record
+// keys and re-runs search() vs. search_steered() for the same query as the
+// alpha slider moves. Reuses renderHits/renderRecordRow, same as Search.
+const steeringForm = document.getElementById("steering-form");
+const steeringKeyAInput = document.getElementById("steering-key-a");
+const steeringKeyBInput = document.getElementById("steering-key-b");
+const steeringQueryInput = document.getElementById("steering-query");
+const steeringButton = document.getElementById("steering-button");
+const steeringAlphaInput = document.getElementById("steering-alpha");
+const steeringAlphaValueEl = document.getElementById("steering-alpha-value");
+const steeringStatusEl = document.getElementById("steering-status");
+const steeringVectorEl = document.getElementById("steering-vector");
+const steeringPlainEl = document.getElementById("steering-plain-results");
+const steeringSteeredEl = document.getElementById("steering-steered-results");
+
+// The (key_a, key_b, query) triple from the last successful "Compare" --
+// the alpha slider re-runs against this same triple on every drag, rather
+// than requiring a fresh form submit to feel live. `null` until the first
+// successful Compare, which is also what keeps the (disabled-by-default)
+// slider from firing requests before there's anything to steer between.
+let steeringLastParams = null;
+// Monotonic counter so a response for a superseded alpha (one the user has
+// since dragged past) never overwrites a newer one that happened to
+// resolve first.
+let steeringRequestSeq = 0;
+// Single-flight, trailing-edge in-flight guard: `input` fires once per
+// pixel of drag, and each run re-embeds `query` through a full BERT forward
+// pass, so firing one request per event would queue up a large backlog and
+// make the slider feel frozen rather than live. While a request is
+// in-flight, only the *latest* requested alpha is remembered; it fires the
+// moment the in-flight one finishes, so the UI always converges to
+// wherever the slider currently sits without queuing every intermediate
+// value.
+let steeringInFlight = false;
+let steeringPendingAlpha = null;
+
+async function runSteeringSearch(alpha) {
+  const seq = ++steeringRequestSeq;
+  await submitJsonForm({
+    endpoint: "/steering/search",
+    body: {
+      key_a: steeringLastParams.keyA,
+      key_b: steeringLastParams.keyB,
+      query: steeringLastParams.query,
+      alpha,
+    },
+    button: steeringButton,
+    messageEl: steeringStatusEl,
+    pendingText: "Building steering vector and searching...",
+    onSuccess: (result) => {
+      if (seq !== steeringRequestSeq) return;
+      renderHits(steeringPlainEl, result.plain);
+      renderHits(steeringSteeredEl, result.steered);
+      steeringStatusEl.textContent =
+        `${result.plain.length} plain hit(s), ${result.steered.length} steered hit(s) ` +
+        `at alpha=${alpha.toFixed(2)}.`;
+      steeringVectorEl.textContent =
+        `SteeringVector: dim=${result.steering.dim}, alpha=${result.steering.alpha.toFixed(2)}, ` +
+        `commitment=${result.steering.commitment}`;
+    },
+  });
+}
+
+async function requestSteeringAlpha(alpha) {
+  steeringPendingAlpha = alpha;
+  if (steeringInFlight) return;
+  steeringInFlight = true;
+  while (steeringPendingAlpha !== null) {
+    const next = steeringPendingAlpha;
+    steeringPendingAlpha = null;
+    await runSteeringSearch(next);
+  }
+  steeringInFlight = false;
+}
+
+steeringForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const keyA = steeringKeyAInput.value.trim();
+  const keyB = steeringKeyBInput.value.trim();
+  const query = steeringQueryInput.value.trim();
+  if (keyA === "" || keyB === "" || !query) return;
+
+  steeringLastParams = { keyA: Number(keyA), keyB: Number(keyB), query };
+  steeringAlphaInput.disabled = false;
+  steeringPlainEl.innerHTML = "";
+  steeringSteeredEl.innerHTML = "";
+  await requestSteeringAlpha(Number(steeringAlphaInput.value));
+});
+
+steeringAlphaInput.addEventListener("input", () => {
+  const alpha = Number(steeringAlphaInput.value);
+  steeringAlphaValueEl.textContent = alpha.toFixed(2);
+  if (!steeringLastParams) return;
+  requestSteeringAlpha(alpha);
+});
+
+// Graph Explorer tab (Issue #17): Path mode renders geodesic() + its
+// trajectory::path_geometry() plus a bifurcation_ratio() against a
+// same-length comparison walk; Walk mode renders weighted_random_walk()
+// (biased by a SteeringVector built through the same #16 construction
+// Steering uses) next to a plain random_walk() from the same start. Both
+// modes share the key_a/key_b picks and reuse renderRecordRow, same as
+// every other tab.
+const graphForm = document.getElementById("graph-form");
+const graphKeyAInput = document.getElementById("graph-key-a");
+const graphKeyBInput = document.getElementById("graph-key-b");
+const graphSeedInput = document.getElementById("graph-seed");
+const graphStepsInput = document.getElementById("graph-steps");
+const graphButton = document.getElementById("graph-button");
+const graphModeInputs = document.querySelectorAll('input[name="graph-mode"]');
+const graphAlphaRowEl = document.getElementById("graph-alpha-row");
+const graphAlphaInput = document.getElementById("graph-alpha");
+const graphAlphaValueEl = document.getElementById("graph-alpha-value");
+const graphStatusEl = document.getElementById("graph-status");
+const graphStatsEl = document.getElementById("graph-stats");
+const graphPathViewEl = document.getElementById("graph-path-view");
+const graphWalkViewEl = document.getElementById("graph-walk-view");
+const graphHopsEl = document.getElementById("graph-hops");
+const graphPathListEl = document.getElementById("graph-path-list");
+const graphGeometryEl = document.getElementById("graph-geometry");
+const graphComparisonListEl = document.getElementById("graph-comparison-list");
+const graphComparisonGeometryEl = document.getElementById("graph-comparison-geometry");
+const graphBifurcationEl = document.getElementById("graph-bifurcation");
+const graphSteeringVectorEl = document.getElementById("graph-steering-vector");
+const graphPlainWalkEl = document.getElementById("graph-plain-walk");
+const graphBiasedWalkEl = document.getElementById("graph-biased-walk");
+
+function graphMode() {
+  return document.querySelector('input[name="graph-mode"]:checked').value;
+}
+
+function renderNodeList(listEl, nodes) {
+  listEl.innerHTML = "";
+  if (!nodes || nodes.length === 0) {
+    listEl.innerHTML = "<li>No records.</li>";
+    return;
+  }
+  for (const node of nodes) {
+    listEl.appendChild(renderRecordRow(node.key, node.metadata));
+  }
+}
+
+function formatGeometry(g) {
+  return `length=${g.length.toFixed(4)}, mean_curvature=${g.mean_curvature.toFixed(4)} rad, ` +
+    `min_adjacent_cosine=${g.min_adjacent_cosine.toFixed(4)} (n_steps=${g.n_steps})`;
+}
+
+function formatBifurcation(b) {
+  const ratio = b.separation_ratio === null ? "n/a" : b.separation_ratio.toFixed(4);
+  const onset = b.onset_step === null ? "never" : `step ${b.onset_step}`;
+  return `separation_ratio=${ratio}, diverges past 1.5x baseline at ${onset}, ` +
+    `final_separation=${b.final_separation.toFixed(4)}`;
+}
+
+async function runGraphExplore(keyA, keyB, seed) {
+  await submitJsonForm({
+    endpoint: "/graph/explore",
+    body: { key_a: keyA, key_b: keyB, seed },
+    button: graphButton,
+    messageEl: graphStatusEl,
+    pendingText: "Building graph and computing geodesic...",
+    onSuccess: (result) => {
+      graphStatsEl.textContent = `${result.n_nodes} node(s), ${result.n_edges} edge(s) in this graph.`;
+      if (!result.geodesic) {
+        graphStatusEl.textContent = `No path -- record ${keyB} is unreachable from ${keyA} in this graph.`;
+        graphHopsEl.textContent = "0";
+        graphPathListEl.innerHTML = "";
+        graphGeometryEl.textContent = "";
+        graphComparisonListEl.innerHTML = "";
+        graphComparisonGeometryEl.textContent = "";
+        graphBifurcationEl.textContent = "";
+        return;
+      }
+      const g = result.geodesic;
+      graphStatusEl.textContent = `geodesic(${keyA}, ${keyB}): ${g.hops} hop(s).`;
+      graphHopsEl.textContent = String(g.hops);
+      renderNodeList(graphPathListEl, g.path);
+      graphGeometryEl.textContent = formatGeometry(g.geometry);
+      if (g.comparison) {
+        renderNodeList(graphComparisonListEl, g.comparison.path);
+        graphComparisonGeometryEl.textContent = formatGeometry(g.comparison.geometry);
+        graphBifurcationEl.textContent = formatBifurcation(g.comparison.bifurcation);
+      } else {
+        graphComparisonListEl.innerHTML = "";
+        graphComparisonGeometryEl.textContent =
+          "0 hops (A and B are the same record) -- no comparison path to anchor.";
+        graphBifurcationEl.textContent = "";
+      }
+    },
+  });
+}
+
+async function runGraphWalk(keyA, keyB, alpha, steps, seed) {
+  await submitJsonForm({
+    endpoint: "/graph/walk",
+    body: { key_a: keyA, key_b: keyB, alpha, steps, seed },
+    button: graphButton,
+    messageEl: graphStatusEl,
+    pendingText: "Building steering vector and walking...",
+    onSuccess: (result) => {
+      renderNodeList(graphPlainWalkEl, result.plain);
+      renderNodeList(graphBiasedWalkEl, result.biased);
+      graphSteeringVectorEl.textContent =
+        `SteeringVector: dim=${result.steering.dim}, alpha=${result.steering.alpha.toFixed(2)}, ` +
+        `commitment=${result.steering.commitment}`;
+      graphStatusEl.textContent =
+        `${result.plain.length} plain step(s), ${result.biased.length} biased step(s) at alpha=${alpha.toFixed(2)}.`;
+    },
+  });
+}
+
+graphModeInputs.forEach((input) => {
+  input.addEventListener("change", () => {
+    const isWalk = graphMode() === "walk";
+    graphPathViewEl.style.display = isWalk ? "none" : "";
+    graphWalkViewEl.style.display = isWalk ? "" : "none";
+    graphAlphaRowEl.style.display = isWalk ? "" : "none";
+    graphStatusEl.textContent = "";
+  });
+});
+
+graphForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const keyA = graphKeyAInput.value.trim();
+  const keyB = graphKeyBInput.value.trim();
+  const seed = graphSeedInput.value.trim();
+  if (keyA === "" || keyB === "" || seed === "") return;
+
+  if (graphMode() === "walk") {
+    graphPlainWalkEl.innerHTML = "";
+    graphBiasedWalkEl.innerHTML = "";
+    graphSteeringVectorEl.textContent = "";
+    await runGraphWalk(
+      Number(keyA), Number(keyB), Number(graphAlphaInput.value), Number(graphStepsInput.value), Number(seed)
+    );
+  } else {
+    await runGraphExplore(Number(keyA), Number(keyB), Number(seed));
+  }
+});
+
+graphAlphaInput.addEventListener("input", () => {
+  graphAlphaValueEl.textContent = Number(graphAlphaInput.value).toFixed(2);
+});
+
+// Bandit Arena tab (Issue #18): each search Thompson-samples a region via
+// RegionTree::sample() (the server's Corpus::bandit_query) and ranks that
+// region's own records against the query; a thumbs up/down on any rendered
+// result feeds RegionTree::observe() (Corpus::bandit_feedback) for that
+// specific record. Sample counts are shown per region as proportional bars
+// -- no chart library, same idiom as the page's own .stats/.class-group.
+const banditForm = document.getElementById("bandit-form");
+const banditQueryInput = document.getElementById("bandit-query");
+const banditButton = document.getElementById("bandit-button");
+const banditStatusEl = document.getElementById("bandit-status");
+const banditCandidatesEl = document.getElementById("bandit-candidates");
+const banditRegionsEl = document.getElementById("bandit-regions");
+
+// Routes through `submitJsonForm`, same as every other tab's POST -- the
+// clicked thumbs button is `button` (disabled for the request's duration,
+// so a rapid double-click can't fire two `observe()` calls for one click)
+// and the row's own `.belief` span is `messageEl`.
+function sendBanditFeedback(key, reward, button, messageEl) {
+  return submitJsonForm({
+    endpoint: "/bandit/feedback",
+    body: { key, reward },
+    button,
+    messageEl,
+    pendingText: "Recording feedback...",
+    onSuccess: (result) => {
+      messageEl.textContent = `belief: alpha=${result.alpha.toFixed(2)}, beta=${result.beta.toFixed(2)}`;
+    },
+  });
+}
+
+// Reuses `renderRecordRow` for the base row (key + score header + Verify
+// button + metadata text, same as every other tab's list), then appends a
+// thumbs up/down control -- rather than hand-rolling the row's markup a
+// second time.
+function renderBanditCandidates(listEl, candidates) {
+  listEl.innerHTML = "";
+  if (!candidates || candidates.length === 0) {
+    listEl.innerHTML = "<li>No records in this region.</li>";
+    return;
+  }
+  for (const c of candidates) {
+    const scoreHtml = `<span class="score">score=${c.score.toFixed(4)}</span> `;
+    const li = renderRecordRow(c.key, c.metadata, scoreHtml);
+
+    const feedback = document.createElement("div");
+    feedback.className = "bandit-feedback";
+    feedback.innerHTML =
+      `<button type="button" class="thumbs-up">&#128077;</button>` +
+      `<button type="button" class="thumbs-down">&#128078;</button>` +
+      `<span class="belief hint"></span>`;
+    const beliefEl = feedback.querySelector(".belief");
+    const upButton = feedback.querySelector(".thumbs-up");
+    const downButton = feedback.querySelector(".thumbs-down");
+    upButton.addEventListener("click", () => sendBanditFeedback(c.key, 1.0, upButton, beliefEl));
+    downButton.addEventListener("click", () => sendBanditFeedback(c.key, 0.0, downButton, beliefEl));
+    li.appendChild(feedback);
+
+    listEl.appendChild(li);
+  }
+}
+
+// Every region the tree has, in the server's fixed order, each starting at
+// sample_count 0 -- so a region a viewer hasn't been steered toward yet is
+// still visible as a bar of length 0, not simply missing from the list.
+function renderBanditRegions(listEl, regions) {
+  listEl.innerHTML = "";
+  if (!regions || regions.length === 0) {
+    listEl.innerHTML = "<li>No regions yet.</li>";
+    return;
+  }
+  const maxCount = Math.max(1, ...regions.map((r) => r.sample_count));
+  regions.forEach((r, i) => {
+    const li = document.createElement("li");
+    const pct = (r.sample_count / maxCount) * 100;
+    li.innerHTML =
+      `<div class="bandit-region-label">region ${i + 1} (${r.keys.length} record(s), keys ${r.keys.join(", ")}): ` +
+      `${r.sample_count} sample(s)</div>` +
+      `<div class="bandit-region-bar"><div class="bandit-region-fill" style="width:${pct}%"></div></div>`;
+    listEl.appendChild(li);
+  });
+}
+
+banditForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const query = banditQueryInput.value.trim();
+  if (!query) return;
+
+  await submitJsonForm({
+    endpoint: "/bandit/query",
+    body: { query },
+    button: banditButton,
+    messageEl: banditStatusEl,
+    pendingText: "Sampling a region and searching within it...",
+    onSuccess: (result) => {
+      renderBanditCandidates(banditCandidatesEl, result.candidates);
+      renderBanditRegions(banditRegionsEl, result.regions);
+      banditStatusEl.textContent =
+        `cycle ${result.step}: sampled a region with ${result.candidates.length} record(s).`;
+    },
+  });
+});
+</script>
+</body>
+</html>

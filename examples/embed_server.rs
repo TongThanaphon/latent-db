@@ -14,8 +14,8 @@
 //!         -H 'Content-Type: application/json' \
 //!         -d '{"text":"what temperature to bake bread"}'
 
-use std::sync::Mutex;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use anyhow::{Error as E, Result};
 use axum::extract::State;
@@ -44,11 +44,21 @@ impl Embedder {
         let client = HFClientSync::new()?;
         let repo = client.model("sentence-transformers", "all-MiniLM-L6-v2");
         let revision = "main";
-        let config_filename = repo.download_file().filename("config.json").revision(revision).send()?;
-        let tokenizer_filename =
-            repo.download_file().filename("tokenizer.json").revision(revision).send()?;
-        let weights_filename =
-            repo.download_file().filename("model.safetensors").revision(revision).send()?;
+        let config_filename = repo
+            .download_file()
+            .filename("config.json")
+            .revision(revision)
+            .send()?;
+        let tokenizer_filename = repo
+            .download_file()
+            .filename("tokenizer.json")
+            .revision(revision)
+            .send()?;
+        let weights_filename = repo
+            .download_file()
+            .filename("model.safetensors")
+            .revision(revision)
+            .send()?;
 
         let config = std::fs::read_to_string(config_filename)?;
         let config: Config = serde_json::from_str(&config)?;
@@ -57,7 +67,11 @@ impl Embedder {
             unsafe { VarBuilder::from_mmaped_safetensors(&[weights_filename], DTYPE, &device)? };
         let model = BertModel::load(vb, &config)?;
 
-        Ok(Self { model, tokenizer, device })
+        Ok(Self {
+            model,
+            tokenizer,
+            device,
+        })
     }
 
     fn embed(&mut self, sentences: &[&str]) -> Result<Vec<Vec<f32>>> {
@@ -81,14 +95,21 @@ impl Embedder {
             .collect::<Result<Vec<_>>>()?;
         let attention_mask = tokens
             .iter()
-            .map(|t| Ok(Tensor::new(t.get_attention_mask().to_vec().as_slice(), &self.device)?))
+            .map(|t| {
+                Ok(Tensor::new(
+                    t.get_attention_mask().to_vec().as_slice(),
+                    &self.device,
+                )?)
+            })
             .collect::<Result<Vec<_>>>()?;
 
         let token_ids = Tensor::stack(&token_ids, 0)?;
         let attention_mask = Tensor::stack(&attention_mask, 0)?;
         let token_type_ids = token_ids.zeros_like()?;
 
-        let hidden = self.model.forward(&token_ids, &token_type_ids, Some(&attention_mask))?;
+        let hidden = self
+            .model
+            .forward(&token_ids, &token_type_ids, Some(&attention_mask))?;
 
         let mask = attention_mask.to_dtype(DTYPE)?.unsqueeze(2)?;
         let sum_mask = mask.sum(1)?;
@@ -97,7 +118,9 @@ impl Embedder {
         let normalized = normalize_l2(&pooled)?;
 
         let (n, _dim) = normalized.dims2()?;
-        (0..n).map(|i| Ok(normalized.get(i)?.to_vec1::<f32>()?)).collect()
+        (0..n)
+            .map(|i| Ok(normalized.get(i)?.to_vec1::<f32>()?))
+            .collect()
     }
 }
 
@@ -121,7 +144,9 @@ async fn embed_handler(
 ) -> Result<Json<EmbedResponse>, (axum::http::StatusCode, String)> {
     let embedding = tokio::task::spawn_blocking(move || {
         let mut embedder = embedder.lock().unwrap();
-        embedder.embed(&[req.text.as_str()]).map(|mut v| v.remove(0))
+        embedder
+            .embed(&[req.text.as_str()])
+            .map(|mut v| v.remove(0))
     })
     .await
     .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?

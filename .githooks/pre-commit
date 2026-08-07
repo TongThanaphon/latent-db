@@ -1,0 +1,29 @@
+#!/bin/sh
+# Pre-commit checks for latent-db (Rust): fmt, clippy, test.
+# Skips entirely if no staged files are Rust-relevant.
+
+set -e
+
+staged_rust_files=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.rs$|^Cargo\.(toml|lock)$' || true)
+
+if [ -z "$staged_rust_files" ]; then
+    exit 0
+fi
+
+echo "Running cargo fmt --check..."
+if ! cargo fmt --check; then
+    echo "cargo fmt found unformatted code. Run 'cargo fmt' and re-stage." >&2
+    exit 1
+fi
+
+echo "Running cargo clippy..."
+if ! cargo clippy --all-targets -- -D warnings; then
+    echo "cargo clippy reported issues. Fix them before committing." >&2
+    exit 1
+fi
+
+echo "Running cargo test..."
+if ! cargo test; then
+    echo "cargo test failed. Fix failing tests before committing." >&2
+    exit 1
+fi

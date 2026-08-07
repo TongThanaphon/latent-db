@@ -15,14 +15,18 @@
 //! | MerkleOctree / MerkleProof | `merkle` module -- per-record inclusion proofs |
 //! | Viable Manifold Graph     | `manifold::ViableGraph` -- kNN graph over a predicate-filtered record subset, `geodesic()` / `random_walk()` traversal (`build_viable_graph()`) |
 //! | Latent Field Steering     | `steering::SteeringVector` -- frozen direction + strength shifts the query before search (`search_steered()`) |
+//! | Manifold Bandit / LatentTaskTree | `bandit::RegionTree` -- PCA + recursive-k-means region tree over stored records, Thompson-sampled (`sample()`) and reward-updated (`observe()`) (`build_region_tree()`) |
+//! | neuron-db's `recall_blended` | Reciprocal Rank Fusion of a lexical/metadata term-overlap ranking with the vector `search()` ranking (`search_blended()`) -- this crate's first borrowing from neuron-db rather than katgpt-rs |
 
-use std::collections::HashMap;
+use std::cell::{Ref, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::bandit::{RegionTree, RegionTreeConfig};
 use crate::index::CentroidIndex;
 use crate::manifold::{self, ViableGraph};
 use crate::merkle::{self, Digest, MerkleProof, MerkleTree};
@@ -30,11 +34,237 @@ use crate::pq::PqCodec;
 use crate::projector::Projector;
 use crate::steering::SteeringVector;
 
+/// Flat, pre-allocated storage for every record's PQ codes + metadata,
+/// indexed directly by record id: `codes[id * code_len .. +code_len]`, a
+/// parallel `hash`/`meta_span`/`live` entry per id. Ids are assigned once by
+/// `LatentDb::next_id` and never reused, so `id` doubles as a stable slot
+/// index -- no separate id-to-slot lookup is needed. `insert`/`remove`/reads
+/// within capacity just index into already-allocated memory; the only
+/// points this ever touches the global allocator are the four parallel
+/// arrays' own geometric-doubling growth (like `Vec::push`'s amortized
+/// growth), plus `meta_bytes` growing on that same amortized schedule, one
+/// buffer below.
+///
+/// `meta_bytes` is a single append-only buffer holding every record's
+/// metadata concatenated together, sliced per-record via `meta_span`
+/// (offset, len) -- mirrors the "one big buffer, no per-record Vec/String"
+/// pattern katgpt-rs uses for its own KV-cache and slot-table storage,
+/// applied to metadata as well as codes. It grows independently of the
+/// other four arrays (its own `Vec<u8>`, sized by total metadata bytes
+/// rather than record count), via `Vec::extend_from_slice`'s own amortized
+/// growth rather than `ensure_capacity`. Removing a record clears its
+/// `live` bit but does not reclaim its `meta_bytes` span or its `codes`
+/// slot; see the README for what that means for long-running
+/// eviction-heavy DBs.
 #[derive(Serialize, Deserialize)]
-struct StoredRecord {
-    hash: u64,
+struct RecordArena {
+    code_len: usize,
     codes: Vec<u8>,
-    metadata: String,
+    hash: Vec<u64>,
+    /// (offset, len) into `meta_bytes` for each id's metadata.
+    meta_span: Vec<(u32, u32)>,
+    meta_bytes: Vec<u8>,
+    live: Vec<bool>,
+    len: usize,
+}
+
+impl RecordArena {
+    fn new(code_len: usize) -> Self {
+        RecordArena {
+            code_len,
+            codes: Vec::new(),
+            hash: Vec::new(),
+            meta_span: Vec::new(),
+            meta_bytes: Vec::new(),
+            live: Vec::new(),
+            len: 0,
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.live.len()
+    }
+
+    /// Grow every parallel array so slot `min_capacity - 1` is addressable.
+    /// Doubles (like `Vec::push`'s own amortized growth) rather than
+    /// growing to the exact minimum, so a run of sequential ids only hits
+    /// the allocator O(log n) times, not once per id.
+    fn ensure_capacity(&mut self, min_capacity: usize) {
+        if self.capacity() >= min_capacity {
+            return;
+        }
+        let new_capacity = min_capacity.max(self.capacity().saturating_mul(2)).max(16);
+        self.codes.resize(new_capacity * self.code_len, 0);
+        self.hash.resize(new_capacity, 0);
+        self.meta_span.resize(new_capacity, (0, 0));
+        self.live.resize(new_capacity, false);
+    }
+
+    /// Store record `id`: `write_codes` is applied directly to this id's
+    /// arena slot (no intermediate `Vec<u8>` -- the caller encodes straight
+    /// into arena memory), and `metadata`'s bytes are appended to the flat
+    /// metadata buffer. The only allocations this can cause are the arena's
+    /// own amortized growth: `ensure_capacity` growing to fit `id`, and/or
+    /// `meta_bytes` growing to fit the appended metadata.
+    fn insert(&mut self, id: u64, hash: u64, metadata: &str, write_codes: impl FnOnce(&mut [u8])) {
+        let idx = id as usize;
+        self.ensure_capacity(idx + 1);
+
+        let stride = self.code_len;
+        write_codes(&mut self.codes[idx * stride..idx * stride + stride]);
+        self.hash[idx] = hash;
+
+        let offset = self.meta_bytes.len() as u32;
+        self.meta_bytes.extend_from_slice(metadata.as_bytes());
+        self.meta_span[idx] = (offset, metadata.len() as u32);
+
+        if !self.live[idx] {
+            self.len += 1;
+        }
+        self.live[idx] = true;
+    }
+
+    fn is_live(&self, id: u64) -> bool {
+        (id as usize) < self.live.len() && self.live[id as usize]
+    }
+
+    fn codes(&self, id: u64) -> Option<&[u8]> {
+        if !self.is_live(id) {
+            return None;
+        }
+        let idx = id as usize;
+        let start = idx * self.code_len;
+        Some(&self.codes[start..start + self.code_len])
+    }
+
+    fn hash(&self, id: u64) -> Option<u64> {
+        self.is_live(id).then(|| self.hash[id as usize])
+    }
+
+    fn metadata(&self, id: u64) -> Option<&str> {
+        if !self.is_live(id) {
+            return None;
+        }
+        let (offset, len) = self.meta_span[id as usize];
+        let bytes = &self.meta_bytes[offset as usize..offset as usize + len as usize];
+        // Valid UTF-8 and in-bounds by construction: `insert` is the only
+        // writer and always appends a whole `&str`'s own bytes, and
+        // `LatentDb::validate_after_deserialize` (called by every
+        // deserialization entry point -- `load`, `WasmLatentDb::from_bytes`)
+        // re-checks both properties for arenas that didn't come from
+        // `insert` at all. A panic here means one of those two guarantees
+        // has a bug, not that untrusted bytes reached this unchecked.
+        Some(std::str::from_utf8(bytes).expect("metadata bytes are valid utf8 by construction"))
+    }
+
+    /// Clear id's live bit and return its stored hash, if it was live.
+    /// Leaves its `codes` slot and `meta_bytes` span as unreclaimed dead
+    /// space (see the struct docs and README).
+    fn remove(&mut self, id: u64) -> Option<u64> {
+        if !self.is_live(id) {
+            return None;
+        }
+        let idx = id as usize;
+        self.live[idx] = false;
+        self.len -= 1;
+        Some(self.hash[idx])
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Every currently-live id, in ascending order (a side effect of
+    /// scanning slots 0..capacity in order -- ids are never reused, so this
+    /// is also insertion order among still-live records).
+    fn ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.live
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, &live)| live.then_some(idx as u64))
+    }
+
+    /// Rank every currently-live record by how many distinct `query_terms`
+    /// (already lowercased by the caller) appear as an exact,
+    /// whitespace-delimited token in its metadata, descending by that
+    /// overlap count, ties broken by ascending id for a deterministic
+    /// order. Records with zero overlap are dropped -- a lexical ranker has
+    /// nothing to say about a record it found no match in, the same way an
+    /// ANN index has nothing to say about a bucket it never probed.
+    fn lexical_rank(&self, query_terms: &HashSet<String>) -> Vec<(u64, usize)> {
+        let mut scored: Vec<(u64, usize)> = self
+            .ids()
+            .filter_map(|id| {
+                let metadata = self.metadata(id)?;
+                let matched: HashSet<String> = metadata
+                    .split_whitespace()
+                    .map(|w| w.to_lowercase())
+                    .filter(|w| query_terms.contains(w))
+                    .collect();
+                (!matched.is_empty()).then_some((id, matched.len()))
+            })
+            .collect();
+
+        scored.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        scored
+    }
+
+    /// Cross-field invariant check for an arena that may not have come from
+    /// `insert` -- i.e. one just produced by `bincode::deserialize`.
+    /// `insert`/`remove` above are the only writers on the normal path and
+    /// always keep these invariants true by construction, so this is never
+    /// called there; it exists purely so a corrupted or hand-crafted byte
+    /// stream fails here, at the deserialization boundary, instead of
+    /// succeeding and then panicking later inside `codes()`/`metadata()`
+    /// (e.g. from deep inside `search()` or `merkle_leaves()`). Mirrors
+    /// what bincode's own `String`/`Vec<u8>` deserialization already
+    /// guaranteed for the old per-record `HashMap<u64, StoredRecord>`
+    /// storage this arena replaced.
+    fn validate(&self) -> Result<(), String> {
+        let capacity = self.live.len();
+        if self.codes.len() != capacity * self.code_len {
+            return Err(format!(
+                "codes length {} does not match capacity {capacity} * code_len {}",
+                self.codes.len(),
+                self.code_len
+            ));
+        }
+        if self.hash.len() != capacity || self.meta_span.len() != capacity {
+            return Err(format!(
+                "hash length {} / meta_span length {} does not match capacity {capacity}",
+                self.hash.len(),
+                self.meta_span.len()
+            ));
+        }
+        let live_count = self.live.iter().filter(|&&live| live).count();
+        if live_count != self.len {
+            return Err(format!(
+                "len {} does not match {live_count} live slots",
+                self.len
+            ));
+        }
+        for (idx, &live) in self.live.iter().enumerate() {
+            if !live {
+                continue;
+            }
+            let (offset, span_len) = self.meta_span[idx];
+            let end = offset as usize + span_len as usize;
+            let bytes = self.meta_bytes.get(offset as usize..end).ok_or_else(|| {
+                format!(
+                    "id {idx}: metadata span {offset}..{end} is out of bounds \
+                     (meta_bytes len {})",
+                    self.meta_bytes.len()
+                )
+            })?;
+            std::str::from_utf8(bytes)
+                .map_err(|e| format!("id {idx}: metadata bytes are not valid utf8: {e}"))?;
+        }
+        Ok(())
+    }
 }
 
 /// Eviction policy applied once `record_budget` is exceeded.
@@ -60,13 +290,24 @@ pub enum EvictionPolicy {
     LowestEnergy,
 }
 
+/// Build products [`LatentDb::ensure_merkle_cache`] caches across
+/// `merkle_root()`/`merkle_proof()` calls: the tree itself (see `merkle.rs`
+/// -- it already holds every level, not just the root) plus the ascending
+/// id list mapping a record id to its leaf index (`ids[i]` is the id of leaf
+/// `i`), so `merkle_proof(id)` can binary-search straight to a leaf index
+/// instead of the linear scan a fresh `merkle_leaves()` call would need.
+struct MerkleCache {
+    ids: Vec<u64>,
+    tree: MerkleTree,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct LatentDb {
     dim: usize,
     projector: Projector,
     pq: PqCodec,
     index: CentroidIndex,
-    records: HashMap<u64, StoredRecord>,
+    records: RecordArena,
     /// content hash -> id, for de-duplication on insert
     hash_to_id: HashMap<u64, u64>,
     next_id: u64,
@@ -74,6 +315,23 @@ pub struct LatentDb {
     /// every `insert()` and whenever changed via `set_record_budget()`.
     record_budget: usize,
     eviction_policy: EvictionPolicy,
+    /// Reusable `projector.project_into` output buffer for `insert`, so it
+    /// doesn't need to allocate a fresh `Vec<f32>` every call just to
+    /// immediately hand it to `index.insert` and discard it. Skipped in
+    /// (de)serialization -- re-sized lazily on first use after `load()`.
+    #[serde(skip)]
+    scratch: Vec<f32>,
+    /// Lazily-built Merkle tree cache, `RefCell`-wrapped so `merkle_root()`/
+    /// `merkle_proof()` can stay `&self` while still filling it in on first
+    /// use. `None` means "rebuild on next access" -- true right after
+    /// construction/deserialization, and set by `invalidate_merkle_cache()`
+    /// after every `insert`/`remove`. See `ensure_merkle_cache`. This is the
+    /// one field that makes `LatentDb` no longer auto-`Sync` (every other
+    /// field is a plain, `Sync` value) -- fine today since nothing in this
+    /// crate shares a `LatentDb` across threads, but worth knowing if that
+    /// ever changes.
+    #[serde(skip)]
+    merkle_cache: RefCell<Option<MerkleCache>>,
 }
 
 pub struct SearchHit {
@@ -135,16 +393,19 @@ impl LatentDb {
             seed.wrapping_add(2),
         );
 
+        let code_len = pq.code_len();
         LatentDb {
             dim,
             projector,
             pq,
             index,
-            records: HashMap::new(),
+            records: RecordArena::new(code_len),
             hash_to_id: HashMap::new(),
             next_id: 0,
             record_budget: 0,
             eviction_policy: EvictionPolicy::OldestFirst,
+            scratch: vec![0.0; sketch_dim],
+            merkle_cache: RefCell::new(None),
         }
     }
 
@@ -192,37 +453,48 @@ impl LatentDb {
         let id = self.next_id;
         self.next_id += 1;
 
-        let codes = self.pq.encode(embedding);
-        let projected = self.projector.project(embedding);
-        self.index.insert(id, &projected);
+        let metadata = metadata.into();
 
-        self.records.insert(
-            id,
-            StoredRecord {
-                hash,
-                codes,
-                metadata: metadata.into(),
-            },
-        );
+        if self.scratch.len() != self.projector.out_dim() {
+            self.scratch = vec![0.0; self.projector.out_dim()];
+        }
+        self.projector.project_into(embedding, &mut self.scratch);
+        self.index.insert(id, &self.scratch);
+
+        let pq = &self.pq;
+        self.records
+            .insert(id, hash, &metadata, |slot| pq.encode_into(embedding, slot));
+
         self.hash_to_id.insert(hash, id);
+        self.invalidate_merkle_cache();
         self.enforce_budget();
         Ok(id)
     }
 
     pub fn remove(&mut self, id: u64) {
-        if let Some(rec) = self.records.remove(&id) {
-            self.hash_to_id.remove(&rec.hash);
+        if let Some(hash) = self.records.remove(id) {
+            self.hash_to_id.remove(&hash);
             self.index.remove(id);
+            self.invalidate_merkle_cache();
         }
+    }
+
+    /// Drop the cached Merkle tree so the next `merkle_root()`/
+    /// `merkle_proof()` call rebuilds it from the live record set. Called by
+    /// `insert`/`remove` whenever they actually change the stored record
+    /// set (not on `insert`'s de-dup fast path, which returns before this
+    /// point without touching any record).
+    fn invalidate_merkle_cache(&mut self) {
+        *self.merkle_cache.get_mut() = None;
     }
 
     /// Reconstruct the (approximate, PQ-decoded) embedding for a record.
     pub fn get_approx_vector(&self, id: u64) -> Option<Vec<f32>> {
-        self.records.get(&id).map(|r| self.pq.decode(&r.codes))
+        self.records.codes(id).map(|codes| self.pq.decode(codes))
     }
 
     pub fn get_metadata(&self, id: u64) -> Option<&str> {
-        self.records.get(&id).map(|r| r.metadata.as_str())
+        self.records.metadata(id)
     }
 
     pub fn len(&self) -> usize {
@@ -233,32 +505,137 @@ impl LatentDb {
         self.records.is_empty()
     }
 
+    /// The vector-ranking half of [`Self::search`], factored out so
+    /// `search_blended()` can feed the same ranking's rank *positions* (not
+    /// its raw scores) into Reciprocal Rank Fusion. Returns `(id, score)`
+    /// pairs sorted descending by score, *not* truncated to any `k` --
+    /// truncation and metadata lookup are each caller's own concern.
+    fn vector_ranked_candidates(&self, query: &[f32], nprobe: usize) -> Vec<(u64, f32)> {
+        let projected_query = self.projector.project(query);
+        let candidates = self.index.candidates(&projected_query, nprobe);
+
+        let lut = self.pq.build_query_lut(query);
+        let mut scored: Vec<(u64, f32)> = candidates
+            .into_iter()
+            .filter_map(|id| {
+                let codes = self.records.codes(id)?;
+                Some((id, lut.cosine_score(codes)))
+            })
+            .collect();
+
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        scored
+    }
+
     /// Approximate nearest-neighbour search. `nprobe` controls how many
     /// centroid buckets get scanned (higher = more accurate, slower).
+    ///
+    /// Candidates are scored via a per-query asymmetric-distance lookup
+    /// table (`PqCodec::build_query_lut`): the query's dot product and norm
+    /// against every centroid in every subspace is computed once
+    /// (`vector_ranked_candidates`), then each candidate's stored codes are
+    /// summed against that table (`QueryLut::cosine_score`) -- no
+    /// per-candidate PQ decode, no per-candidate allocation.
     pub fn search(&self, query: &[f32], k: usize, nprobe: usize) -> Vec<SearchHit> {
         if query.len() != self.dim {
             return Vec::new();
         }
-        let projected_query = self.projector.project(query);
-        let candidates = self.index.candidates(&projected_query, nprobe);
-
-        let mut scored: Vec<SearchHit> = candidates
+        let mut scored = self.vector_ranked_candidates(query, nprobe);
+        scored.truncate(k);
+        scored
             .into_iter()
-            .filter_map(|id| {
-                let rec = self.records.get(&id)?;
-                let approx = self.pq.decode(&rec.codes);
-                let score = crate::superpose::cosine_sim(query, &approx);
+            .filter_map(|(id, score)| {
+                let metadata = self.records.metadata(id)?.to_string();
                 Some(SearchHit {
                     id,
                     score,
-                    metadata: rec.metadata.clone(),
+                    metadata,
+                })
+            })
+            .collect()
+    }
+
+    /// Reciprocal Rank Fusion: fold one ranking's ids, in rank order, into
+    /// `scores` -- a record at rank `r` (1-indexed, i.e. `ranked_ids`'
+    /// position + 1) contributes `1 / (RRF_K + r)`, and a record this
+    /// ranking never mentions contributes nothing. Called once per ranking
+    /// being fused, so a record present in both accumulates both
+    /// contributions.
+    fn accumulate_rrf(scores: &mut HashMap<u64, f32>, ranked_ids: impl Iterator<Item = u64>) {
+        const RRF_K: f32 = 60.0;
+        for (rank, id) in ranked_ids.enumerate() {
+            *scores.entry(id).or_insert(0.0) += 1.0 / (RRF_K + (rank + 1) as f32);
+        }
+    }
+
+    /// Like [`Self::search`], but fuses a lexical/metadata term-overlap
+    /// ranking (`query_terms` against each stored record's `metadata`
+    /// string, see `RecordArena::lexical_rank`) with the vector `search()`
+    /// ranking via Reciprocal Rank Fusion -- the fusion technique
+    /// neuron-db's `recall_blended` implements to combine its own lexical
+    /// and semantic recall paths (this crate's first borrowing from
+    /// neuron-db rather than katgpt-rs; see the module docs).
+    ///
+    /// RRF only needs each ranking's *rank position*, not comparable score
+    /// scales, which is what makes it a clean way to combine two very
+    /// differently-scaled rankings (cosine similarity vs. term overlap
+    /// count) without hand-tuned weighting (`accumulate_rrf`). Fused scores
+    /// are summed across both rankings, sorted descending (ties broken by
+    /// ascending id), and truncated to `k`. The returned `SearchHit::score`
+    /// is this fused RRF score, not a cosine similarity -- comparable only
+    /// against other `search_blended` results, not against `search`'s
+    /// scores.
+    ///
+    /// The vector half is still bounded by `nprobe` (only the probed
+    /// buckets' candidates can contribute a vector rank), but the lexical
+    /// half scans every live record's metadata regardless of `nprobe` --
+    /// mirroring two independent recall paths (bounded ANN vs. full-text)
+    /// being fused, rather than lexical matching being limited to whatever
+    /// the vector index happened to probe.
+    ///
+    /// Degrades to exactly `search(query_embedding, k, nprobe)` (same ids,
+    /// order, and scores) when `query_terms` is empty, since there's then
+    /// nothing for a lexical ranking to contribute.
+    ///
+    /// Returns an empty `Vec` if `query_embedding`'s dimension doesn't match
+    /// `self.dim()`, matching `search`'s own dim-mismatch convention.
+    pub fn search_blended(
+        &self,
+        query_terms: &[&str],
+        query_embedding: &[f32],
+        k: usize,
+        nprobe: usize,
+    ) -> Vec<SearchHit> {
+        if query_embedding.len() != self.dim {
+            return Vec::new();
+        }
+        if query_terms.is_empty() {
+            return self.search(query_embedding, k, nprobe);
+        }
+
+        let query_terms: HashSet<String> = query_terms.iter().map(|t| t.to_lowercase()).collect();
+        let vector_ranked = self.vector_ranked_candidates(query_embedding, nprobe);
+        let lexical_ranked = self.records.lexical_rank(&query_terms);
+
+        let mut fused_scores: HashMap<u64, f32> = HashMap::new();
+        Self::accumulate_rrf(&mut fused_scores, vector_ranked.iter().map(|&(id, _)| id));
+        Self::accumulate_rrf(&mut fused_scores, lexical_ranked.iter().map(|&(id, _)| id));
+
+        let mut fused: Vec<SearchHit> = fused_scores
+            .into_iter()
+            .filter_map(|(id, score)| {
+                let metadata = self.records.metadata(id)?.to_string();
+                Some(SearchHit {
+                    id,
+                    score,
+                    metadata,
                 })
             })
             .collect();
 
-        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
-        scored.truncate(k);
-        scored
+        fused.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap().then(a.id.cmp(&b.id)));
+        fused.truncate(k);
+        fused
     }
 
     /// Like [`Self::search`], but first shifts a copy of `query` by
@@ -306,12 +683,40 @@ impl LatentDb {
     where
         F: Fn(&[f32]) -> bool,
     {
-        let mut ids: Vec<u64> = self.records.keys().copied().collect();
-        ids.sort_unstable();
-        let records = ids
-            .into_iter()
-            .map(|id| (id, self.pq.decode(&self.records[&id].codes)));
+        // `RecordArena::ids()` already yields ascending order (a side
+        // effect of scanning slots in order), so no separate sort is needed
+        // here the way the old `HashMap`-backed version required.
+        let records = self
+            .records
+            .ids()
+            .map(|id| (id, self.pq.decode(self.records.codes(id).unwrap())));
         manifold::build_viable_graph(records, predicate, k_nearest, edge_midpoint_check)
+    }
+
+    /// Build a [`RegionTree`] over every currently-stored record's
+    /// approximate decoded vector: a hierarchical clustering (PCA +
+    /// recursive k-means, see the `bandit` module) whose leaves are
+    /// individual records and whose internal nodes are regions. Thompson-
+    /// sample a region to explore next via `RegionTree::sample()`, then feed
+    /// back how useful it was via `RegionTree::observe()`.
+    ///
+    /// Ids are visited in ascending order before decoding, the same
+    /// determinism guarantee `build_viable_graph()` makes -- so the
+    /// resulting tree's k-means splits (and therefore `sample()`'s output
+    /// for a given seed) are stable across rebuilds of the same record set.
+    ///
+    /// Like `build_viable_graph()`, this is meant to be rebuilt when the
+    /// record set changes meaningfully rather than maintained incrementally.
+    ///
+    /// # Panics
+    /// Panics if the database is empty -- see [`RegionTree::build`].
+    pub fn build_region_tree(&self, config: RegionTreeConfig) -> RegionTree {
+        let records: Vec<(u64, Vec<f32>)> = self
+            .records
+            .ids()
+            .map(|id| (id, self.pq.decode(self.records.codes(id).unwrap())))
+            .collect();
+        RegionTree::build(&records, config)
     }
 
     /// Compression ratio achieved by PQ storage vs. keeping raw f32 vectors.
@@ -352,7 +757,7 @@ impl LatentDb {
     /// "uniform/redundant vs. information-dense" framing katgpt-rs's
     /// `SpectralLOD` docs describe, just measured over vectors and their
     /// centroids instead of token-ID variance within a span.
-    fn energy(&self, id: u64, rec: &StoredRecord) -> f32 {
+    fn energy(&self, id: u64) -> f32 {
         let centroid = self
             .index
             .assigned_centroid(id)
@@ -360,7 +765,10 @@ impl LatentDb {
         let Some(centroid) = centroid else {
             return f32::MAX; // not indexed (shouldn't happen) -- never evict first
         };
-        let approx = self.pq.decode(&rec.codes);
+        let Some(codes) = self.records.codes(id) else {
+            return f32::MAX; // not stored (shouldn't happen) -- never evict first
+        };
+        let approx = self.pq.decode(codes);
         let projected = self.projector.project(&approx);
         projected
             .iter()
@@ -379,15 +787,23 @@ impl LatentDb {
             return;
         }
 
-        let mut ids: Vec<u64> = self.records.keys().copied().collect();
+        let mut ids: Vec<u64> = self.records.ids().collect();
         match self.eviction_policy {
-            EvictionPolicy::OldestFirst => ids.sort_unstable(),
+            // `RecordArena::ids()` already yields ascending (oldest-first)
+            // order, so there's nothing left to do here -- kept as an
+            // explicit arm (rather than folding this into an `if`) so the
+            // compiler still flags this match as non-exhaustive if a third
+            // `EvictionPolicy` variant is ever added.
+            EvictionPolicy::OldestFirst => {}
             EvictionPolicy::LowestEnergy => {
-                ids.sort_by(|&a, &b| {
-                    let ea = self.energy(a, &self.records[&a]);
-                    let eb = self.energy(b, &self.records[&b]);
-                    ea.total_cmp(&eb)
-                });
+                // Precompute every candidate's energy once -- O(n) energy
+                // evaluations -- then sort the precomputed list, instead of
+                // recomputing `energy()` (a decode + project) inside the
+                // sort comparator, which would evaluate it O(n log n) times.
+                let mut scored: Vec<(u64, f32)> =
+                    ids.iter().map(|&id| (id, self.energy(id))).collect();
+                scored.sort_by(|a, b| a.1.total_cmp(&b.1));
+                ids = scored.into_iter().map(|(id, _)| id).collect();
             }
         }
 
@@ -396,39 +812,65 @@ impl LatentDb {
         }
     }
 
-    fn record_leaf_bytes(id: u64, rec: &StoredRecord) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(16 + rec.codes.len() + rec.metadata.len());
+    fn record_leaf_bytes(id: u64, hash: u64, codes: &[u8], metadata: &str) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(16 + codes.len() + metadata.len());
         bytes.extend_from_slice(&id.to_le_bytes());
-        bytes.extend_from_slice(&rec.hash.to_le_bytes());
-        bytes.extend_from_slice(&rec.codes);
-        bytes.extend_from_slice(rec.metadata.as_bytes());
+        bytes.extend_from_slice(&hash.to_le_bytes());
+        bytes.extend_from_slice(codes);
+        bytes.extend_from_slice(metadata.as_bytes());
         bytes
     }
 
     /// Ids in ascending order paired with their Merkle leaf hash -- the
-    /// canonical, deterministic leaf ordering. A `HashMap`'s own iteration
-    /// order isn't stable across runs, so `merkle_root()` would otherwise
-    /// change on every reload even with identical records.
+    /// canonical, deterministic leaf ordering. `RecordArena::ids()` already
+    /// yields ascending order (arena slots are scanned in order), so this
+    /// stays stable across reloads the same way the old explicit sort over
+    /// a `HashMap`'s keys did.
     fn merkle_leaves(&self) -> Vec<(u64, Digest)> {
-        let mut ids: Vec<u64> = self.records.keys().copied().collect();
-        ids.sort_unstable();
-        ids.into_iter()
+        self.records
+            .ids()
             .map(|id| {
-                let rec = &self.records[&id];
-                (id, merkle::hash_leaf(&Self::record_leaf_bytes(id, rec)))
+                let hash = self.records.hash(id).unwrap();
+                let codes = self.records.codes(id).unwrap();
+                let metadata = self.records.metadata(id).unwrap();
+                (
+                    id,
+                    merkle::hash_leaf(&Self::record_leaf_bytes(id, hash, codes, metadata)),
+                )
             })
             .collect()
     }
 
-    /// Build a fresh Merkle tree over every currently-stored record. This
-    /// is rebuilt from scratch on every call rather than maintained
-    /// incrementally on insert/remove -- fine at this crate's prototype
-    /// scale (same tradeoff as the batch-trained PQ codebooks and centroid
-    /// index, see the design notes), and it guarantees `merkle_root()` /
-    /// `merkle_proof()` always reflect the live record set exactly, with no
-    /// risk of a stale cached tree drifting out of sync.
+    /// Fill `merkle_cache` from the live record set if it's currently empty
+    /// (construction/deserialization, or the most recent `insert`/`remove`
+    /// invalidated it via `invalidate_merkle_cache`). A no-op otherwise, so
+    /// any number of `merkle_root()`/`merkle_proof()` calls between two
+    /// mutations pay this O(n log n) `merkle_leaves()` rehash + tree build
+    /// exactly once, not once per call.
+    fn ensure_merkle_cache(&self) {
+        if self.merkle_cache.borrow().is_some() {
+            return;
+        }
+        let leaves = self.merkle_leaves();
+        let ids = leaves.iter().map(|(id, _)| *id).collect();
+        let tree = MerkleTree::build(leaves.into_iter().map(|(_, h)| h).collect());
+        *self.merkle_cache.borrow_mut() = Some(MerkleCache { ids, tree });
+    }
+
+    /// Fill the cache if needed (`ensure_merkle_cache`), then hand back a
+    /// borrow of it -- the one place `merkle_tree`/`merkle_root`/
+    /// `merkle_proof` all go through, so there's a single ensure-then-borrow
+    /// path instead of three copies of it.
+    fn cached_merkle(&self) -> Ref<'_, MerkleCache> {
+        self.ensure_merkle_cache();
+        Ref::map(self.merkle_cache.borrow(), |cache| cache.as_ref().unwrap())
+    }
+
+    /// The Merkle tree over every currently-stored record, reusing the
+    /// cached build (see `ensure_merkle_cache`) rather than rebuilding from
+    /// scratch when nothing has changed since the last call.
     pub fn merkle_tree(&self) -> MerkleTree {
-        MerkleTree::build(self.merkle_leaves().into_iter().map(|(_, h)| h).collect())
+        self.cached_merkle().tree.clone()
     }
 
     /// Root commitment over every currently-stored record. Publish or store
@@ -437,16 +879,23 @@ impl LatentDb {
     /// record was included in that checkpoint without needing the whole
     /// database.
     pub fn merkle_root(&self) -> Digest {
-        self.merkle_tree().root()
+        self.cached_merkle().tree.root()
     }
 
     /// Inclusion proof that record `id` is part of the current
     /// `merkle_root()`. Returns `None` if `id` isn't currently stored.
+    ///
+    /// Reuses the cached tree and id list when nothing has changed since the
+    /// last call (see `ensure_merkle_cache`): once cached, this is an O(log
+    /// n) binary search for `id`'s leaf index followed by an O(log n)
+    /// sibling-path lookup against the tree's cached levels (`MerkleTree`
+    /// keeps every level, not just the root -- see `merkle.rs`), instead of
+    /// the full O(n log n) rehash + rebuild the old always-rebuild
+    /// implementation paid on every single call.
     pub fn merkle_proof(&self, id: u64) -> Option<MerkleProof> {
-        let leaves = self.merkle_leaves();
-        let position = leaves.iter().position(|(lid, _)| *lid == id)?;
-        let tree = MerkleTree::build(leaves.into_iter().map(|(_, h)| h).collect());
-        tree.proof(position)
+        let cache = self.cached_merkle();
+        let position = cache.ids.binary_search(&id).ok()?;
+        cache.tree.proof(position)
     }
 
     /// Persist the whole DB (codebooks, index, compressed records) to disk.
@@ -463,7 +912,20 @@ impl LatentDb {
         let mut f = File::open(path).map_err(LatentDbError::Io)?;
         let mut bytes = Vec::new();
         f.read_to_end(&mut bytes).map_err(LatentDbError::Io)?;
-        bincode::deserialize(&bytes).map_err(|e| LatentDbError::Serialize(e.to_string()))
+        let db: LatentDb =
+            bincode::deserialize(&bytes).map_err(|e| LatentDbError::Serialize(e.to_string()))?;
+        db.validate_after_deserialize()?;
+        Ok(db)
+    }
+
+    /// Check `records`'s cross-field invariants (see
+    /// `RecordArena::validate`'s doc comment). Every deserialization entry
+    /// point -- `load` above, and `wasm::WasmLatentDb::from_bytes`, which
+    /// deserializes independently since `std::fs` (and therefore `load`)
+    /// has no real backing on `wasm32-unknown-unknown` -- must call this
+    /// before treating a freshly-deserialized `LatentDb` as trustworthy.
+    pub(crate) fn validate_after_deserialize(&self) -> Result<(), LatentDbError> {
+        self.records.validate().map_err(LatentDbError::Serialize)
     }
 }
 
@@ -499,6 +961,52 @@ mod tests {
         assert_eq!(hits[0].id, ids[10]);
     }
 
+    /// Issue 2 acceptance criterion: `search`'s LUT-scored top-k must match
+    /// the pre-change (decode + `cosine_sim`) baseline's ids, order, and
+    /// scores (within float tolerance) on a fixed synthetic corpus.
+    /// `nprobe = n_index_centroids()` makes `search`'s candidate set
+    /// exhaustive -- every stored id -- so the "baseline" computed here by
+    /// decoding every record and scoring it directly is exactly what
+    /// `search` itself scores, just via the old decode path instead of the
+    /// new LUT path.
+    #[test]
+    fn search_lut_scoring_matches_decode_baseline_topk_and_order() {
+        let corpus = synthetic_corpus(500, 32, 70);
+        let mut db = LatentDb::build(&corpus, 4, 16, 8, 8, 71);
+        let mut ids = Vec::new();
+        for (i, v) in corpus.iter().enumerate() {
+            ids.push(db.insert(v, format!("r{i}")).unwrap());
+        }
+
+        let query = &corpus[123];
+        let k = 10;
+        let hits = db.search(query, k, db.n_index_centroids());
+
+        let mut reference: Vec<(u64, f32)> = ids
+            .iter()
+            .map(|&id| {
+                let approx = db.get_approx_vector(id).unwrap();
+                (id, crate::superpose::cosine_sim(query, &approx))
+            })
+            .collect();
+        reference.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        reference.truncate(k);
+
+        assert_eq!(hits.len(), reference.len());
+        for (hit, &(ref_id, ref_score)) in hits.iter().zip(reference.iter()) {
+            assert_eq!(
+                hit.id, ref_id,
+                "top-k ordering diverged from decode baseline"
+            );
+            assert!(
+                (hit.score - ref_score).abs() < 1e-4,
+                "score diverged beyond tolerance: lut={} decode={}",
+                hit.score,
+                ref_score
+            );
+        }
+    }
+
     #[test]
     fn duplicate_insert_deduplicates_by_content_hash() {
         let corpus = synthetic_corpus(50, 16, 2);
@@ -518,11 +1026,73 @@ mod tests {
         for (i, v) in corpus.iter().enumerate() {
             db.insert(v, format!("r{i}")).unwrap();
         }
+        let root_before_save = db.merkle_root();
         let tmp = std::env::temp_dir().join("latent-db_test.bin");
         db.save(&tmp).unwrap();
         let loaded = LatentDb::load(&tmp).unwrap();
         assert_eq!(loaded.len(), db.len());
         assert_eq!(loaded.get_metadata(0), db.get_metadata(0));
+        // `merkle_cache` is `#[serde(skip)]`, so this exercises a fresh
+        // post-load build of the cache, not a (nonexistent) deserialized one.
+        assert_eq!(loaded.merkle_root(), root_before_save);
+        std::fs::remove_file(tmp).ok();
+    }
+
+    #[test]
+    fn record_arena_validate_accepts_a_freshly_built_arena() {
+        let mut arena = RecordArena::new(2);
+        arena.insert(0, 42, "hello", |slot| slot.copy_from_slice(&[1, 2]));
+        arena.insert(1, 7, "world", |slot| slot.copy_from_slice(&[3, 4]));
+        assert!(arena.validate().is_ok());
+    }
+
+    #[test]
+    fn record_arena_validate_rejects_an_out_of_bounds_metadata_span() {
+        let mut arena = RecordArena::new(2);
+        arena.insert(0, 42, "hello", |slot| slot.copy_from_slice(&[1, 2]));
+        arena.meta_span[0] = (0, 9999);
+        assert!(arena.validate().is_err());
+    }
+
+    #[test]
+    fn record_arena_validate_rejects_invalid_utf8_metadata() {
+        let mut arena = RecordArena::new(2);
+        arena.insert(0, 42, "hello", |slot| slot.copy_from_slice(&[1, 2]));
+        let (offset, len) = arena.meta_span[0];
+        let start = offset as usize;
+        // Same length as the original "hello" span, but not valid UTF-8.
+        for b in &mut arena.meta_bytes[start..start + len as usize] {
+            *b = 0xFF;
+        }
+        assert!(arena.validate().is_err());
+    }
+
+    /// The invariant `validate` checks used to be enforced for free by
+    /// bincode's own `String` deserialization (the old per-record
+    /// `HashMap<u64, StoredRecord>` storage this arena replaced would fail
+    /// `load()` with a `Result::Err` on corrupted metadata bytes, since a
+    /// `String` field can't deserialize invalid UTF-8 at all). This proves
+    /// `load()` still fails the same way -- at the deserialization
+    /// boundary, not later with a panic inside `search()`/`merkle_leaves()`
+    /// -- now that metadata lives in a raw `Vec<u8>` arena buffer bincode
+    /// itself doesn't validate.
+    #[test]
+    fn load_rejects_a_corrupted_arena_instead_of_deserializing_successfully() {
+        let corpus = synthetic_corpus(20, 16, 500);
+        let mut db = LatentDb::build(&corpus, 2, 8, 4, 8, 501);
+        for v in &corpus {
+            db.insert(v, "x").unwrap();
+        }
+        db.records.meta_span[0] = (0, u32::MAX);
+
+        let tmp = std::env::temp_dir().join("latent-db_corrupt_test.bin");
+        db.save(&tmp).unwrap();
+        let result = LatentDb::load(&tmp);
+        assert!(
+            result.is_err(),
+            "load() should reject a corrupted arena rather than succeeding and \
+             leaving a later, unrelated call to panic"
+        );
         std::fs::remove_file(tmp).ok();
     }
 
@@ -582,6 +1152,54 @@ mod tests {
         assert!(db.merkle_proof(id).is_none());
     }
 
+    /// Repeated `merkle_root()`/`merkle_proof()` calls with no mutation in
+    /// between must keep returning the exact same values as the cached tree
+    /// is reused -- proves reusing the cache doesn't silently drift from
+    /// what a fresh rebuild would produce.
+    #[test]
+    fn repeated_merkle_calls_without_mutation_are_stable() {
+        let corpus = synthetic_corpus(25, 16, 14);
+        let mut db = LatentDb::build(&corpus, 2, 8, 4, 8, 15);
+        let mut ids = Vec::new();
+        for (i, v) in corpus.iter().enumerate() {
+            ids.push(db.insert(v, format!("r{i}")).unwrap());
+        }
+
+        let root_a = db.merkle_root();
+        let root_b = db.merkle_root();
+        assert_eq!(root_a, root_b);
+
+        for &id in &ids {
+            let proof_a = db.merkle_proof(id).unwrap();
+            let proof_b = db.merkle_proof(id).unwrap();
+            assert_eq!(proof_a.leaf_index, proof_b.leaf_index);
+            assert_eq!(proof_a.leaf_hash, proof_b.leaf_hash);
+            assert_eq!(proof_a.siblings, proof_b.siblings);
+            assert!(proof_a.verify(&root_a));
+        }
+    }
+
+    /// A record inserted after the cache was already warmed by an earlier
+    /// `merkle_root()`/`merkle_proof()` call must still show up: the cache
+    /// has to be invalidated and rebuilt on `insert`, not served stale.
+    #[test]
+    fn merkle_proof_sees_records_inserted_after_the_cache_was_warmed() {
+        let corpus = synthetic_corpus(10, 16, 16);
+        let mut db = LatentDb::build(&corpus, 2, 8, 4, 8, 17);
+        let first_id = db.insert(&corpus[0], "first").unwrap();
+
+        // Warm the cache before the second insert.
+        let _ = db.merkle_root();
+        let _ = db.merkle_proof(first_id);
+
+        let second_id = db.insert(&corpus[1], "second").unwrap();
+        let root = db.merkle_root();
+        let proof = db
+            .merkle_proof(second_id)
+            .expect("record inserted after cache warm-up should still be provable");
+        assert!(proof.verify(&root));
+    }
+
     #[test]
     fn zero_budget_is_unlimited_by_default() {
         let corpus = synthetic_corpus(50, 16, 20);
@@ -608,10 +1226,16 @@ mod tests {
         // The 5 highest (newest) ids should be the ones still present.
         let newest: Vec<u64> = ids[ids.len() - 5..].to_vec();
         for id in newest {
-            assert!(db.get_metadata(id).is_some(), "newest record {id} should survive");
+            assert!(
+                db.get_metadata(id).is_some(),
+                "newest record {id} should survive"
+            );
         }
         for id in &ids[..ids.len() - 5] {
-            assert!(db.get_metadata(*id).is_none(), "oldest record {id} should be evicted");
+            assert!(
+                db.get_metadata(*id).is_none(),
+                "oldest record {id} should be evicted"
+            );
         }
     }
 
@@ -644,7 +1268,9 @@ mod tests {
                 corpus.push(v);
             }
         }
-        let outlier: Vec<f32> = (0..16).map(|i| if i % 2 == 0 { 50.0 } else { -50.0 }).collect();
+        let outlier: Vec<f32> = (0..16)
+            .map(|i| if i % 2 == 0 { 50.0 } else { -50.0 })
+            .collect();
         corpus.push(outlier.clone());
 
         let mut db = LatentDb::build(&corpus, 2, 8, 2, 8, 26);
@@ -725,6 +1351,104 @@ mod tests {
         );
     }
 
+    /// Issue 9 acceptance criterion: a record whose `metadata` unambiguously
+    /// matches the query terms, but whose embedding is equally
+    /// (dis)similar to two far-apart clusters, should rank above plain
+    /// vector search's top hit once lexical and vector rankings are fused.
+    ///
+    /// Two tight clusters sit at opposite constant vectors (-5s and +5s);
+    /// the ambiguous record's embedding alternates +3/-3 so its *raw* dot
+    /// product against an all-(-5) query is exactly zero -- the same "no
+    /// lean toward either cluster" signal a genuinely in-between embedding
+    /// would give a cosine-based ranker (PQ quantization can nudge the
+    /// actual `cosine_score` slightly off zero, but not toward either
+    /// cluster in particular). Only that record's metadata contains the
+    /// query terms.
+    #[test]
+    fn search_blended_ranks_lexically_unambiguous_but_vector_ambiguous_record_above_plain_search() {
+        let dim = 16;
+        let mut corpus = Vec::new();
+        for center in [-5.0f32, 5.0] {
+            for i in 0..8 {
+                let mut v = vec![center; dim];
+                v[1] += i as f32 * 0.001; // tiny jitter so cluster members aren't identical
+                corpus.push(v);
+            }
+        }
+        let ambiguous: Vec<f32> = (0..dim)
+            .map(|i| if i % 2 == 0 { 3.0 } else { -3.0 })
+            .collect();
+        corpus.push(ambiguous);
+
+        let mut db = LatentDb::build(&corpus, 2, 8, 4, 8, 100);
+        let mut ids = Vec::new();
+        for (i, v) in corpus.iter().enumerate() {
+            let metadata = if i == corpus.len() - 1 {
+                "widget catalog".to_string()
+            } else {
+                format!("record-{i}")
+            };
+            ids.push(db.insert(v, metadata).unwrap());
+        }
+        let ambiguous_id = *ids.last().unwrap();
+
+        // Dead-center on cluster A: plain vector search should strongly
+        // prefer pure cluster-A members over the equally-(dis)similar
+        // ambiguous record.
+        let query = vec![-5.0f32; dim];
+        let query_terms = ["widget", "catalog"];
+        let nprobe = db.n_index_centroids();
+
+        let plain = db.search(&query, 5, nprobe);
+        assert_ne!(
+            plain[0].id, ambiguous_id,
+            "plain vector search shouldn't favor the vector-ambiguous record"
+        );
+
+        let blended = db.search_blended(&query_terms, &query, 5, nprobe);
+        assert_eq!(
+            blended[0].id, ambiguous_id,
+            "an unambiguous lexical match should win the fused ranking"
+        );
+    }
+
+    /// Issue 9 acceptance criterion: with no query terms, there's nothing
+    /// for a lexical ranking to contribute, so `search_blended` must
+    /// degrade to exactly `search`'s ids, order, and scores.
+    #[test]
+    fn search_blended_with_no_query_terms_matches_plain_vector_search() {
+        let corpus = synthetic_corpus(120, 16, 200);
+        let mut db = LatentDb::build(&corpus, 2, 8, 4, 8, 201);
+        for v in &corpus {
+            db.insert(v, "x").unwrap();
+        }
+        let query = &corpus[5];
+        let nprobe = db.n_index_centroids();
+
+        let plain = db.search(query, 5, nprobe);
+        let blended = db.search_blended(&[], query, 5, nprobe);
+
+        assert_eq!(plain.len(), blended.len());
+        for (a, b) in plain.iter().zip(blended.iter()) {
+            assert_eq!(a.id, b.id);
+            assert_eq!(a.score, b.score);
+            assert_eq!(a.metadata, b.metadata);
+        }
+    }
+
+    #[test]
+    fn search_blended_rejects_dimension_mismatch() {
+        let corpus = synthetic_corpus(50, 16, 300);
+        let mut db = LatentDb::build(&corpus, 2, 8, 4, 8, 301);
+        for v in &corpus {
+            db.insert(v, "x").unwrap();
+        }
+        let wrong_dim_query = vec![0.0f32; 8];
+        assert!(db
+            .search_blended(&["x"], &wrong_dim_query, 5, db.n_index_centroids())
+            .is_empty());
+    }
+
     #[test]
     fn build_viable_graph_restricts_to_the_predicate_and_walks_stay_inside_it() {
         let corpus = synthetic_corpus(120, 8, 60);
@@ -752,5 +1476,24 @@ mod tests {
         for id in walk {
             assert!(db.get_approx_vector(id).unwrap()[0] > 0.0);
         }
+    }
+
+    #[test]
+    fn build_region_tree_covers_every_stored_record() {
+        let corpus = synthetic_corpus(60, 16, 90);
+        let mut db = LatentDb::build(&corpus, 4, 16, 8, 8, 91);
+        let mut ids = Vec::new();
+        for (i, v) in corpus.iter().enumerate() {
+            ids.push(db.insert(v, format!("r{i}")).unwrap());
+        }
+
+        let tree = db.build_region_tree(RegionTreeConfig::default());
+        assert_eq!(tree.num_arms(), db.len());
+        for &id in &ids {
+            assert!(tree.leaf_belief(id).is_some());
+        }
+
+        let arm = tree.sample(1);
+        assert!(ids.contains(&arm));
     }
 }

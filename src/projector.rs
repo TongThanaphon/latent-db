@@ -10,8 +10,8 @@
 //! dimensions approximately preserves pairwise distances, which is exactly
 //! the property we need for an approximate index.
 
-use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -42,7 +42,12 @@ impl Projector {
             let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos();
             matrix.push(z * scale);
         }
-        let mut p = Projector { matrix, in_dim, out_dim, commitment: [0u8; 32] };
+        let mut p = Projector {
+            matrix,
+            in_dim,
+            out_dim,
+            commitment: [0u8; 32],
+        };
         p.commit();
         p
     }
@@ -76,17 +81,23 @@ impl Projector {
 
     /// Project a full-size vector down to the sketch space.
     pub fn project(&self, v: &[f32]) -> Vec<f32> {
-        assert_eq!(v.len(), self.in_dim, "vector dimension mismatch");
         let mut out = vec![0.0f32; self.out_dim];
-        for o in 0..self.out_dim {
-            let row_off = o * self.in_dim;
-            let mut sum = 0.0f32;
-            for i in 0..self.in_dim {
-                sum += self.matrix[row_off + i] * v[i];
-            }
-            out[o] = sum;
-        }
+        self.project_into(v, &mut out);
         out
+    }
+
+    /// Same as [`Self::project`], but writes into a caller-provided buffer
+    /// (`out.len() == self.out_dim()`) instead of allocating a fresh `Vec`.
+    /// Lets a hot path (e.g. `LatentDb::insert`) reuse one scratch buffer
+    /// across calls instead of paying a heap allocation every time.
+    pub fn project_into(&self, v: &[f32], out: &mut [f32]) {
+        assert_eq!(v.len(), self.in_dim, "vector dimension mismatch");
+        assert_eq!(out.len(), self.out_dim, "output buffer size mismatch");
+        for (o, out_val) in out.iter_mut().enumerate() {
+            let row_off = o * self.in_dim;
+            let row = &self.matrix[row_off..row_off + self.in_dim];
+            *out_val = crate::simd::simd_dot_f32(row, v);
+        }
     }
 }
 
@@ -128,5 +139,24 @@ mod tests {
         let bytes = bincode::serialize(&p).unwrap();
         let reloaded: Projector = bincode::deserialize(&bytes).unwrap();
         assert!(reloaded.verify());
+    }
+
+    #[test]
+    fn project_into_matches_project() {
+        let p = Projector::new(64, 8, 42);
+        let v: Vec<f32> = (0..64).map(|i| i as f32 * 0.01).collect();
+        let expected = p.project(&v);
+        let mut out = vec![0.0f32; 8];
+        p.project_into(&v, &mut out);
+        assert_eq!(expected, out);
+    }
+
+    #[test]
+    #[should_panic(expected = "output buffer size mismatch")]
+    fn project_into_rejects_wrong_output_length() {
+        let p = Projector::new(64, 8, 42);
+        let v: Vec<f32> = vec![1.0; 64];
+        let mut out = vec![0.0f32; 4];
+        p.project_into(&v, &mut out);
     }
 }

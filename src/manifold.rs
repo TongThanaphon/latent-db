@@ -21,9 +21,11 @@
 //! parameter.
 //!
 //! Graph build is O(n^2) (pairwise distances for kNN) and, like the
-//! batch-trained PQ codebooks and the from-scratch `merkle_tree()`, is meant
-//! to be rebuilt whenever the underlying record set changes rather than
-//! maintained incrementally -- fine at this crate's prototype scale.
+//! batch-trained PQ codebooks and the per-mutation-rebuilt `merkle_tree()`
+//! (cached across calls, but still a full rebuild the next time it's
+//! touched after an `insert`/`remove`), is meant to be rebuilt whenever the
+//! underlying record set changes rather than maintained incrementally --
+//! fine at this crate's prototype scale.
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
@@ -73,6 +75,12 @@ impl ViableGraph {
                 .collect(),
             None => Vec::new(),
         }
+    }
+
+    /// `id`'s coordinates in this graph's vector space, or `None` if `id`
+    /// isn't a node.
+    pub fn coords_of(&self, id: u64) -> Option<&[f32]> {
+        self.id_to_node.get(&id).map(|&node| self.node_coords(node))
     }
 
     fn node_coords(&self, node: u32) -> &[f32] {
@@ -171,14 +179,246 @@ impl ViableGraph {
         }
         path.into_iter().map(|n| self.ids[n as usize]).collect()
     }
+
+    /// Weighted random walk of `steps` hops starting at `start`: at each
+    /// step, the next node is drawn from the current node's neighbors with
+    /// probability proportional to `weight_fn(current, candidate).max(0.0)`
+    /// (negative weights are treated as zero probability). If every
+    /// candidate's clamped weight is zero, falls back to a uniform draw over
+    /// the candidates, same as [`Self::random_walk`].
+    ///
+    /// Ported from katgpt-rs's `manifold_curiosity_walk`
+    /// (`viable_manifold_graph.rs`) -- an omission from the earlier
+    /// `geodesic`/`random_walk` port from that same source file, not a
+    /// deliberate drop. [`Self::random_walk`] is unaffected and remains the
+    /// plain uniform-draw method.
+    ///
+    /// Same shape contract as [`Self::random_walk`]: returns a path of
+    /// length `steps + 1` (including `start`), an empty `Vec` if `start`
+    /// isn't a node, and parks at the current node for any remaining steps
+    /// once it has no neighbors. `weight_fn` receives `(current_id,
+    /// candidate_id)`, both already resolved to record ids rather than
+    /// internal node indices.
+    pub fn weighted_random_walk<F>(
+        &self,
+        start: u64,
+        steps: usize,
+        seed: u64,
+        weight_fn: F,
+    ) -> Vec<u64>
+    where
+        F: Fn(u64, u64) -> f32,
+    {
+        let Some(&start_node) = self.id_to_node.get(&start) else {
+            return Vec::new();
+        };
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut path: Vec<u32> = Vec::with_capacity(steps + 1);
+        path.push(start_node);
+        let mut cur = start_node;
+        let mut weights: Vec<f32> = Vec::new();
+        for _ in 0..steps {
+            let neighbors = &self.adjacency[cur as usize];
+            if neighbors.is_empty() {
+                let last = *path.last().unwrap();
+                path.resize(steps + 1, last);
+                break;
+            }
+            let cur_id = self.ids[cur as usize];
+            weights.clear();
+            let mut total = 0.0f32;
+            for &n in neighbors {
+                let w = weight_fn(cur_id, self.ids[n as usize]).max(0.0);
+                weights.push(w);
+                total += w;
+            }
+            cur = if total <= 0.0 {
+                neighbors[rng.gen_range(0..neighbors.len())]
+            } else {
+                let mut r = rng.gen::<f32>() * total;
+                // Fallback if float rounding leaves `r` at exactly 0.0
+                // after the loop below instead of going negative: the
+                // *last positive-weight* candidate, never a zero-weight
+                // one (there's at least one positive weight since
+                // `total > 0.0`, so this can't panic).
+                let mut chosen = neighbors[weights.iter().rposition(|&w| w > 0.0).unwrap()];
+                for (i, &w) in weights.iter().enumerate() {
+                    r -= w;
+                    // Strict `<` (not `<=`): a candidate whose clamped
+                    // weight is exactly 0.0 must never be selectable --
+                    // subtracting 0.0 can't push a non-negative `r` below
+                    // zero, so it's provably unreachable here.
+                    if r < 0.0 {
+                        chosen = neighbors[i];
+                        break;
+                    }
+                }
+                chosen
+            };
+            path.push(cur);
+        }
+        path.into_iter().map(|n| self.ids[n as usize]).collect()
+    }
+
+    /// Partition this graph's nodes into `boundary classes`: equivalence
+    /// classes under recursive kNN-neighborhood structure.
+    ///
+    /// A from-scratch reinterpretation of katgpt-rs's bisimulation-refinement
+    /// idea (`crates/katgpt-core/src/bisimulation/refine.rs`,
+    /// signature-based partition refinement over a labeled transition graph)
+    /// for a kNN graph rather than a `(state, op, state')` transition system
+    /// -- `ViableGraph` has no operators between records, so a node's
+    /// "signature" here is just the sorted multiset of its neighbors'
+    /// classes, with no operator-label component. Reimplemented rather than
+    /// ported.
+    ///
+    /// Two nodes end up in the same class when their neighborhoods are
+    /// structurally indistinguishable under this refinement: not merely
+    /// "same literal neighbor id set", but recursively -- the sorted
+    /// multiset of one's neighbors' classes matches the other's exactly
+    /// (same classes, same counts), and that condition is in turn checked
+    /// recursively on the neighbors (so, e.g., two leaves hanging off the
+    /// same hub collapse together even though the hub itself is a distinct
+    /// class). Computed by fixed-point signature refinement (1-WL-style
+    /// color refinement): start every node in one class, then repeatedly
+    /// reclassify each node by the sorted multiset of its neighbors'
+    /// current classes (canonicalizing labels each iteration so the
+    /// fixed-point check can't oscillate on a relabeling) until the
+    /// partition stops changing. Like 1-WL, this is a sound but incomplete
+    /// test: it never merges two nodes that are truly structurally
+    /// distinct, but on some regular substructures (e.g. two non-isomorphic
+    /// neighborhoods that still look alike degree-by-degree at every depth)
+    /// it can under-separate them into one class. Purely additive: doesn't
+    /// read or affect [`Self::geodesic`], [`Self::random_walk`], or
+    /// [`Self::neighbors`].
+    pub fn boundary_classes(&self) -> BoundaryClasses {
+        let n = self.n_nodes();
+        if n == 0 {
+            return BoundaryClasses {
+                id_to_class: HashMap::new(),
+                n_classes: 0,
+            };
+        }
+
+        let mut current_class: Vec<u32> = vec![0; n];
+        let mut new_class: Vec<u32> = vec![0; n];
+        let mut signatures: Vec<Vec<u32>> = vec![Vec::new(); n];
+
+        loop {
+            for (node, sig) in signatures.iter_mut().enumerate() {
+                sig.clear();
+                sig.extend(
+                    self.adjacency[node]
+                        .iter()
+                        .map(|&nbr| current_class[nbr as usize]),
+                );
+                sig.sort_unstable();
+            }
+
+            let mut order: Vec<u32> = (0..n as u32).collect();
+            order.sort_by(|&a, &b| {
+                signatures[a as usize]
+                    .cmp(&signatures[b as usize])
+                    .then(a.cmp(&b))
+            });
+
+            let mut next_class = 0u32;
+            for (pos, &node) in order.iter().enumerate() {
+                if pos > 0 && signatures[node as usize] != signatures[order[pos - 1] as usize] {
+                    next_class += 1;
+                }
+                new_class[node as usize] = next_class;
+            }
+
+            canonicalize_boundary_classes(&mut new_class);
+
+            if new_class == current_class {
+                break;
+            }
+            current_class.copy_from_slice(&new_class);
+        }
+
+        let n_classes = current_class
+            .iter()
+            .copied()
+            .max()
+            .map_or(0, |m| m as usize + 1);
+        let id_to_class = self
+            .ids
+            .iter()
+            .zip(current_class.iter())
+            .map(|(&id, &class)| (id, class))
+            .collect();
+
+        BoundaryClasses {
+            id_to_class,
+            n_classes,
+        }
+    }
 }
 
-fn euclidean(a: &[f32], b: &[f32]) -> f32 {
-    a.iter()
-        .zip(b)
-        .map(|(x, y)| (x - y) * (x - y))
-        .sum::<f32>()
-        .sqrt()
+/// Class id assigned by [`ViableGraph::boundary_classes`].
+pub type BoundaryClassId = u32;
+
+/// Partition of a [`ViableGraph`]'s nodes into boundary classes, computed by
+/// [`ViableGraph::boundary_classes`].
+#[derive(Debug, Clone)]
+pub struct BoundaryClasses {
+    id_to_class: HashMap<u64, BoundaryClassId>,
+    n_classes: usize,
+}
+
+impl BoundaryClasses {
+    /// Number of distinct classes.
+    pub fn n_classes(&self) -> usize {
+        self.n_classes
+    }
+
+    /// `id`'s class, or `None` if `id` wasn't a node of the graph this
+    /// partition was computed from.
+    pub fn class_of(&self, id: u64) -> Option<BoundaryClassId> {
+        self.id_to_class.get(&id).copied()
+    }
+
+    /// Whether `a` and `b` are both graph nodes and share a class.
+    pub fn same_class(&self, a: u64, b: u64) -> bool {
+        matches!((self.class_of(a), self.class_of(b)), (Some(x), Some(y)) if x == y)
+    }
+
+    /// Ids grouped by class: ascending class id, ascending id within each
+    /// class.
+    pub fn classes(&self) -> Vec<Vec<u64>> {
+        let mut groups: Vec<Vec<u64>> = vec![Vec::new(); self.n_classes];
+        for (&id, &class) in &self.id_to_class {
+            groups[class as usize].push(id);
+        }
+        for group in &mut groups {
+            group.sort_unstable();
+        }
+        groups
+    }
+}
+
+/// Renumber class labels so the class of node 0 becomes class 0, the next
+/// new class encountered walking node index ascending becomes 1, etc. --
+/// makes the label vector invariant under class-id permutation, so
+/// [`ViableGraph::boundary_classes`]'s fixed-point check can tell a stable
+/// partition from one that's merely had its labels shuffled between
+/// iterations (which would otherwise oscillate forever).
+fn canonicalize_boundary_classes(labels: &mut [u32]) {
+    let mut old_to_new: HashMap<u32, u32> = HashMap::new();
+    for &label in labels.iter() {
+        let next = old_to_new.len() as u32;
+        old_to_new.entry(label).or_insert(next);
+    }
+    for label in labels.iter_mut() {
+        *label = old_to_new[label];
+    }
+}
+
+pub(crate) fn euclidean(a: &[f32], b: &[f32]) -> f32 {
+    let (a, b) = crate::simd::truncate_to_shorter(a, b);
+    crate::simd::simd_squared_euclidean_f32(a, b).sqrt()
 }
 
 /// Total-order `f32` wrapper so `BinaryHeap` can be used as a min-heap by
@@ -285,6 +525,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::steering::SteeringVector;
+    use crate::superpose::cosine_sim;
 
     /// Two disks (radius 1.5 at (-2,0)/(+2,0)) joined by a thin corridor
     /// (|x|<2 AND |y|<0.4) -- the same toy viable set katgpt-rs's own tests
@@ -313,21 +555,13 @@ mod tests {
     }
 
     fn build_corridor_graph() -> ViableGraph {
-        build_viable_graph(
-            grid_records(0.25).into_iter(),
-            two_disk_corridor,
-            4,
-            true,
-        )
+        build_viable_graph(grid_records(0.25).into_iter(), two_disk_corridor, 4, true)
     }
 
     #[test]
     fn keeps_only_records_passing_the_predicate() {
         let records = grid_records(0.25);
-        let expected_kept = records
-            .iter()
-            .filter(|(_, v)| two_disk_corridor(v))
-            .count();
+        let expected_kept = records.iter().filter(|(_, v)| two_disk_corridor(v)).count();
         let g = build_viable_graph(records.into_iter(), two_disk_corridor, 4, false);
         assert_eq!(g.n_nodes(), expected_kept);
         assert!(g.n_edges() > 0);
@@ -342,8 +576,7 @@ mod tests {
         let predicate = |z: &[f32]| z[0].abs() < 0.5 || (z[0] - 4.0).abs() < 0.5;
         let records = vec![(0u64, vec![0.0, 0.0]), (1u64, vec![4.0, 0.0])];
 
-        let without_check =
-            build_viable_graph(records.clone().into_iter(), predicate, 1, false);
+        let without_check = build_viable_graph(records.clone().into_iter(), predicate, 1, false);
         assert_eq!(
             without_check.geodesic(0, 1),
             Some(vec![0, 1]),
@@ -388,7 +621,10 @@ mod tests {
         assert_eq!(path.first(), Some(&src));
         assert_eq!(path.last(), Some(&dst));
         for id in &path {
-            assert!(two_disk_corridor(&lookup[id]), "path visited non-viable id {id}");
+            assert!(
+                two_disk_corridor(&lookup[id]),
+                "path visited non-viable id {id}"
+            );
         }
         // A shortest path never revisits a node.
         let mut sorted = path.clone();
@@ -435,7 +671,10 @@ mod tests {
         assert_eq!(walk.len(), 41);
         assert_eq!(walk.first(), Some(&start));
         for id in &walk {
-            assert!(two_disk_corridor(&lookup[id]), "walk visited non-viable id {id}");
+            assert!(
+                two_disk_corridor(&lookup[id]),
+                "walk visited non-viable id {id}"
+            );
         }
     }
 
@@ -460,5 +699,299 @@ mod tests {
     fn random_walk_on_unknown_start_is_empty() {
         let g = build_corridor_graph();
         assert!(g.random_walk(999_999, 5, 1).is_empty());
+    }
+
+    // ── weighted_random_walk ─────────────────────────────────────────────
+
+    /// A hub at the origin of an `n_leaves`-dimensional space, plus one leaf
+    /// per axis (one-hot, unit distance from the hub). Every leaf-leaf pair
+    /// is `sqrt(2)` apart, farther than each leaf's `1.0` distance to the
+    /// hub, so with `k_nearest=1` each leaf's own kNN pass always picks the
+    /// hub (same reasoning as `boundary_classes_separates_a_hub_...` below):
+    /// the hub ends up connected to every leaf, and leaves aren't connected
+    /// to each other. Unlike an evenly-spaced circle of leaves, this
+    /// property holds for any `n_leaves` rather than only up to 5.
+    fn star_graph(n_leaves: usize) -> (ViableGraph, u64, Vec<u64>) {
+        let mut records: Vec<(u64, Vec<f32>)> = vec![(0u64, vec![0.0; n_leaves])];
+        let mut leaf_ids = Vec::with_capacity(n_leaves);
+        for i in 0..n_leaves {
+            let mut v = vec![0.0f32; n_leaves];
+            v[i] = 1.0;
+            let id = (i + 1) as u64;
+            records.push((id, v));
+            leaf_ids.push(id);
+        }
+        let g = build_viable_graph(records.into_iter(), |_| true, 1, false);
+        (g, 0u64, leaf_ids)
+    }
+
+    #[test]
+    fn weighted_random_walk_never_leaves_the_viable_subset() {
+        let records = grid_records(0.25);
+        let g = build_viable_graph(records.iter().cloned(), two_disk_corridor, 4, true);
+        let lookup: HashMap<u64, Vec<f32>> = records.into_iter().collect();
+        let start = *lookup.iter().find(|(_, v)| two_disk_corridor(v)).unwrap().0;
+
+        let walk = g.weighted_random_walk(start, 40, 0xC0FFEE, |_, _| 1.0);
+        assert_eq!(walk.len(), 41);
+        assert_eq!(walk.first(), Some(&start));
+        for id in &walk {
+            assert!(
+                two_disk_corridor(&lookup[id]),
+                "walk visited non-viable id {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn weighted_random_walk_is_deterministic_for_a_fixed_seed() {
+        let g = build_corridor_graph();
+        let start = g.ids[0];
+        let walk_a = g.weighted_random_walk(start, 30, 42, |_, _| 1.0);
+        let walk_b = g.weighted_random_walk(start, 30, 42, |_, _| 1.0);
+        assert_eq!(walk_a, walk_b);
+    }
+
+    #[test]
+    fn weighted_random_walk_parks_at_an_isolated_node() {
+        let records = vec![(7u64, vec![0.0, 0.0])];
+        let g = build_viable_graph(records.into_iter(), |_| true, 4, false);
+        let walk = g.weighted_random_walk(7, 5, 1, |_, _| 1.0);
+        assert_eq!(walk, vec![7, 7, 7, 7, 7, 7]);
+    }
+
+    #[test]
+    fn weighted_random_walk_on_unknown_start_is_empty() {
+        let g = build_corridor_graph();
+        assert!(g.weighted_random_walk(999_999, 5, 1, |_, _| 1.0).is_empty());
+    }
+
+    #[test]
+    fn weighted_random_walk_all_zero_weights_falls_back_to_uniform() {
+        let (g, hub, leaves) = star_graph(4);
+        let walk = g.weighted_random_walk(hub, 1, 7, |_, _| 0.0);
+        assert_eq!(walk.len(), 2);
+        assert!(
+            leaves.contains(&walk[1]),
+            "all-zero weights should still land on a valid neighbor"
+        );
+    }
+
+    #[test]
+    fn weighted_random_walk_negative_weights_are_never_chosen() {
+        let (g, hub, leaves) = star_graph(3);
+        // Adjacency lists are sorted by ascending node index, so hub's
+        // neighbor list here is exactly `leaves` in order -- try avoiding
+        // the *first* and *last* positions in that list, since a naive
+        // fallback-selection bug (e.g. defaulting to the last neighbor)
+        // would only show up when the avoided candidate sits at the edge
+        // the fallback favors.
+        for &avoided in &[leaves[0], leaves[leaves.len() - 1]] {
+            for seed in 0..200u64 {
+                let walk =
+                    g.weighted_random_walk(
+                        hub,
+                        1,
+                        seed,
+                        |_, cand| {
+                            if cand == avoided {
+                                -5.0
+                            } else {
+                                1.0
+                            }
+                        },
+                    );
+                assert_ne!(
+                    walk[1], avoided,
+                    "a candidate with a negative (clamped-to-zero) weight must never be picked \
+                     while other candidates have positive weight"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn weighted_random_walk_with_uniform_weights_matches_random_walk_distribution() {
+        // `random_walk`'s `gen_range(0..len)` and `weighted_random_walk`'s
+        // `gen::<f32>() * total` consume `StdRng` differently, so the same
+        // seed can't produce byte-identical sequences between the two
+        // methods -- instead this compares the two methods' per-leaf visit
+        // *distribution* across many seeds, which is what "same statistical
+        // distribution" (issue #7's sanity/regression criterion) means here.
+        let (g, hub, leaves) = star_graph(5);
+        let trials: u64 = 6000;
+        let mut uniform_counts = vec![0u32; leaves.len()];
+        let mut weighted_counts = vec![0u32; leaves.len()];
+        for seed in 0..trials {
+            let u_leaf = g.random_walk(hub, 1, seed)[1];
+            let w_leaf = g.weighted_random_walk(hub, 1, seed, |_, _| 1.0)[1];
+            uniform_counts[leaves.iter().position(|&l| l == u_leaf).unwrap()] += 1;
+            weighted_counts[leaves.iter().position(|&l| l == w_leaf).unwrap()] += 1;
+        }
+        for i in 0..leaves.len() {
+            let u_rate = uniform_counts[i] as f32 / trials as f32;
+            let w_rate = weighted_counts[i] as f32 / trials as f32;
+            assert!(
+                (u_rate - w_rate).abs() < 0.05,
+                "leaf {i}: uniform-weight distribution should match random_walk's, \
+                 got uniform_rate={u_rate}, weighted_rate={w_rate}"
+            );
+        }
+    }
+
+    #[test]
+    fn weighted_random_walk_biased_toward_a_steering_direction_beats_a_plain_random_walk() {
+        let (g, hub, leaves) = star_graph(5);
+        let target_leaf = leaves[0];
+
+        // A direction mostly (not exclusively) aligned with leaf 0's axis,
+        // so candidate weights come out graded rather than a degenerate
+        // all-or-nothing pick.
+        let raw = [0.7f32, 0.3, 0.1, 0.1, 0.1];
+        let norm = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let direction: Vec<f32> = raw.iter().map(|x| x / norm).collect();
+        let steering = SteeringVector::new(direction, 1.0, 1e-3).unwrap();
+
+        let trials: u64 = 400;
+        let steps: usize = 20;
+        let mut weighted_leaf_visits = 0usize;
+        let mut weighted_leaf_slots = 0usize;
+        let mut uniform_leaf_visits = 0usize;
+        let mut uniform_leaf_slots = 0usize;
+
+        for seed in 0..trials {
+            let w_walk = g.weighted_random_walk(hub, steps, seed, |_, cand| {
+                g.coords_of(cand)
+                    .map(|c| cosine_sim(c, steering.as_slice()))
+                    .unwrap_or(0.0)
+            });
+            let u_walk = g.random_walk(hub, steps, seed);
+
+            for &id in &w_walk {
+                if id == hub {
+                    continue;
+                }
+                weighted_leaf_slots += 1;
+                if id == target_leaf {
+                    weighted_leaf_visits += 1;
+                }
+            }
+            for &id in &u_walk {
+                if id == hub {
+                    continue;
+                }
+                uniform_leaf_slots += 1;
+                if id == target_leaf {
+                    uniform_leaf_visits += 1;
+                }
+            }
+        }
+
+        let weighted_rate = weighted_leaf_visits as f32 / weighted_leaf_slots as f32;
+        let uniform_rate = uniform_leaf_visits as f32 / uniform_leaf_slots as f32;
+        assert!(
+            weighted_rate > uniform_rate + 0.2,
+            "steering-biased walk should favor the steered-toward leaf far more often \
+             than a plain random walk: weighted_rate={weighted_rate}, uniform_rate={uniform_rate}"
+        );
+    }
+
+    #[test]
+    fn boundary_classes_separates_a_hub_from_its_symmetric_leaves() {
+        // hub(1) at the origin, two leaves (0, 2) equidistant on either
+        // side -- colinear, so each leaf's own nearest-neighbor pass picks
+        // the hub (dist 1) over the other leaf (dist 2), and the hub ends
+        // up wired to both leaves regardless of which single leaf its own
+        // pass happens to pick (edges are added unconditionally from
+        // whichever side's pass selects them).
+        let records = vec![
+            (0u64, vec![-1.0, 0.0]),
+            (1u64, vec![0.0, 0.0]),
+            (2u64, vec![1.0, 0.0]),
+        ];
+        let g = build_viable_graph(records.into_iter(), |_| true, 1, false);
+        assert_eq!(g.neighbors(1).len(), 2, "hub should connect to both leaves");
+
+        let classes = g.boundary_classes();
+        assert_eq!(classes.n_classes(), 2);
+        assert!(
+            classes.same_class(0, 2),
+            "the two leaves have identical neighbor sets ({{hub}}) and must collapse"
+        );
+        assert!(
+            !classes.same_class(0, 1),
+            "the hub has a structurally distinct neighborhood (degree 2 vs 1)"
+        );
+    }
+
+    #[test]
+    fn boundary_classes_collapse_across_isomorphic_but_disconnected_stars() {
+        // Two copies of the same hub-and-leaves shape, far enough apart
+        // that each node's nearest neighbor stays inside its own copy. A
+        // naive "same literal neighbor id set" partitioning would leave
+        // every node in its own singleton class here -- no two nodes share
+        // a neighbor id across components -- so this exercises the
+        // fixed-point refinement recognizing that group A's hub and group
+        // B's hub play the same structural role despite sharing no
+        // neighbors at all.
+        let records = vec![
+            (10u64, vec![-1.0, 0.0]),
+            (11u64, vec![0.0, 0.0]),
+            (12u64, vec![1.0, 0.0]),
+            (20u64, vec![999.0, 0.0]),
+            (21u64, vec![1000.0, 0.0]),
+            (22u64, vec![1001.0, 0.0]),
+        ];
+        let g = build_viable_graph(records.into_iter(), |_| true, 1, false);
+
+        let classes = g.boundary_classes();
+        assert_eq!(
+            classes.n_classes(),
+            2,
+            "just {{hub, leaf}} structural roles"
+        );
+        assert!(classes.same_class(11, 21), "hub A ~ hub B");
+        assert!(classes.same_class(10, 20), "leaf A ~ leaf B");
+        assert!(classes.same_class(10, 12), "leaves within A collapse");
+        assert!(classes.same_class(12, 22), "leaves across A/B collapse");
+        assert!(!classes.same_class(11, 10), "hub role != leaf role");
+
+        let groups = classes.classes();
+        assert_eq!(groups.len(), 2);
+        let hub_group = groups.iter().find(|group| group.contains(&11)).unwrap();
+        assert_eq!(hub_group, &vec![11, 21]);
+        let leaf_group = groups.iter().find(|group| group.contains(&10)).unwrap();
+        assert_eq!(leaf_group, &vec![10, 12, 20, 22]);
+    }
+
+    #[test]
+    fn boundary_classes_on_empty_graph_has_no_classes() {
+        let g = build_viable_graph(
+            std::iter::empty::<(u64, Vec<f32>)>(),
+            |_: &[f32]| true,
+            4,
+            false,
+        );
+        let classes = g.boundary_classes();
+        assert_eq!(classes.n_classes(), 0);
+        assert_eq!(classes.class_of(0), None);
+        assert!(classes.classes().is_empty());
+    }
+
+    #[test]
+    fn boundary_classes_of_unknown_id_is_none() {
+        let g = build_corridor_graph();
+        assert_eq!(g.boundary_classes().class_of(999_999), None);
+    }
+
+    #[test]
+    fn boundary_classes_is_deterministic() {
+        let g = build_corridor_graph();
+        let a = g.boundary_classes();
+        let b = g.boundary_classes();
+        assert_eq!(a.n_classes(), b.n_classes());
+        for &id in &g.ids {
+            assert_eq!(a.class_of(id), b.class_of(id));
+        }
     }
 }

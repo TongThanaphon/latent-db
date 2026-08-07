@@ -25,16 +25,29 @@ pub struct CentroidIndex {
 impl CentroidIndex {
     /// Build centroids from a batch of *projected* (low-dim) training
     /// vectors using the same simple k-means as the PQ codec.
-    pub fn train(projected_training: &[Vec<f32>], n_centroids: usize, iterations: usize, seed: u64) -> Self {
+    pub fn train(
+        projected_training: &[Vec<f32>],
+        n_centroids: usize,
+        iterations: usize,
+        seed: u64,
+    ) -> Self {
         let centroids = crate::pq::kmeans(projected_training, n_centroids, iterations, seed);
-        CentroidIndex { centroids, buckets: HashMap::new(), assignment: HashMap::new() }
+        CentroidIndex {
+            centroids,
+            buckets: HashMap::new(),
+            assignment: HashMap::new(),
+        }
     }
 
     fn nearest_centroid(&self, projected: &[f32]) -> usize {
         let mut best = 0usize;
         let mut best_dist = f32::MAX;
         for (idx, c) in self.centroids.iter().enumerate() {
-            let d: f32 = c.iter().zip(projected.iter()).map(|(x, y)| (x - y) * (x - y)).sum();
+            let d: f32 = c
+                .iter()
+                .zip(projected.iter())
+                .map(|(x, y)| (x - y) * (x - y))
+                .sum();
             if d < best_dist {
                 best_dist = d;
                 best = idx;
@@ -67,7 +80,11 @@ impl CentroidIndex {
             .iter()
             .enumerate()
             .map(|(idx, c)| {
-                let d: f32 = c.iter().zip(projected_query.iter()).map(|(x, y)| (x - y) * (x - y)).sum();
+                let d: f32 = c
+                    .iter()
+                    .zip(projected_query.iter())
+                    .map(|(x, y)| (x - y) * (x - y))
+                    .sum();
                 (d, idx)
             })
             .collect();
@@ -99,7 +116,12 @@ impl CentroidIndex {
 }
 
 /// Convenience helper: project then insert in one call.
-pub fn project_and_insert(index: &mut CentroidIndex, projector: &Projector, id: u64, full_vec: &[f32]) {
+pub fn project_and_insert(
+    index: &mut CentroidIndex,
+    projector: &Projector,
+    id: u64,
+    full_vec: &[f32],
+) {
     let projected = projector.project(full_vec);
     index.insert(id, &projected);
 }

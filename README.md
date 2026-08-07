@@ -130,6 +130,60 @@ the exact record queried with as the top hit), reports the PQ compression
 ratio, round-trips through save/load, and shows the superposition slot's
 accuracy degrading as more pairs are packed in.
 
+## CLI & HTTP server
+
+`latentdb-cli` is a thin wrapper around the public `LatentDb` API, gated
+behind the `cli` feature (kept separate from the default build so the
+wasm32 `cdylib` target never has to compile axum/tokio):
+
+```bash
+cargo build --release --features cli --bin latentdb-cli
+BIN=./target/release/latentdb-cli
+
+# build: train a fresh (empty) DB from a JSON array-of-arrays training set
+$BIN build --db my.db --training corpus.json \
+    --n-subspaces 8 --n-pq-centroids 32 --n-index-centroids 16 --sketch-dim 8
+
+# insert: add one embedding + metadata, saving the DB back to disk
+$BIN insert --db my.db --embedding "0.1,-0.2,0.3,..." --metadata "doc-1"
+
+# search: approximate nearest-neighbour search, prints JSON hits
+$BIN search --db my.db --query "0.1,-0.2,0.3,..." --k 5 --nprobe 4
+
+# load / save: introspect a DB file, or copy it elsewhere
+$BIN load --db my.db
+$BIN save --db my.db --out my-backup.db
+
+# bench: run (or list) this repo's benches/ suite
+$BIN bench --list
+$BIN bench --name search_bench
+
+# serve: HTTP surface over a loaded DB -- GET /healthz, POST /search, POST /insert
+$BIN serve --db my.db --port 8080
+```
+
+`--embedding`/`--query` take comma-separated floats (negative values are
+fine — `allow_hyphen_values` is set so `-0.2` isn't mistaken for a flag).
+See `tests/cli.rs` for a full build → insert → search → serve round-trip.
+
+## Development
+
+This repo ships a pre-commit hook (`.githooks/pre-commit`) that runs
+`cargo fmt --check`, `cargo clippy`, and `cargo test` on staged Rust changes.
+Enable it once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+The hook doesn't pass `--features cli`, so it never touches
+`src/bin/latentdb-cli/`; when changing the CLI, additionally run:
+
+```bash
+cargo clippy --all-targets --features cli -- -D warnings
+cargo test --features cli
+```
+
 ## Design notes & honest limitations
 
 - **This is a research/embedded-use prototype, not a production vector DB.**
@@ -142,17 +196,34 @@ accuracy degrading as more pairs are packed in.
   well at the scale this demo runs (hundreds–thousands of vectors) but
   large-dimensional, large-N production workloads would want a proper ANN
   library.
+- **Record storage (PQ codes + metadata) is a flat arena keyed by id, and
+  ids are never reused.** Each id gets a fixed-stride slot in one
+  pre-allocated `codes` buffer plus an (offset, len) span into one
+  append-only `meta_bytes` buffer; growing those buffers (geometric
+  doubling) is the only point `insert` touches the global allocator, so
+  steady-state insert/lookup within capacity doesn't. The tradeoff: neither
+  buffer reclaims space on `remove` — a removed id's slot and metadata span
+  just sit dead, gated out by a liveness bit — so memory tracks the
+  high-water mark (`next_id`), not `len()`. A DB that churns heavily under
+  `record_budget` (insert, evict, insert, evict, ...) grows without bound
+  rather than staying flat at the budget size; a production version would
+  want periodic compaction or a free-list of reclaimed slots.
 - **`SuperposedSlot` retrieval is inherently lossy and noisy**, by
   construction — that's the whole point, and unlike katgpt-rs's real
   MUX-Latent (which is lossless — see the note above), there's no fallback
   copy of the original value retained here. Don't use it where exact recall
   matters; use the main `LatentDb` PQ + index path for that instead.
-- **`merkle_root()`/`merkle_proof()` rebuild the whole Merkle tree from
-  scratch on every call** (O(n log n) over the current record count) rather
-  than maintaining it incrementally on insert/remove. Fine at this crate's
-  prototype scale, same tradeoff as the batch-trained PQ codebooks and
-  centroid index; a production version would want an incremental/append-only
-  tree (e.g. a Merkle Mountain Range) instead.
+- **`merkle_root()`/`merkle_proof()` cache the built tree (all levels, not
+  just the root) rather than maintaining it incrementally on insert/remove.**
+  The first call after construction, or after the most recent `insert`/
+  `remove`, pays a full O(n log n) rebuild over the current record count and
+  fills the cache; every further call before the next mutation reuses it, so
+  `merkle_proof(id)` becomes an O(log n) id lookup + sibling-path read
+  instead of another full rebuild. That still means N proof calls between
+  two mutations cost one rebuild instead of N, not a truly incremental tree
+  that updates in O(log n) per `insert`/`remove` — a production version
+  would want that (e.g. a Merkle Mountain Range) to avoid the O(n log n)
+  rebuild cost landing on whichever call happens to follow a mutation.
 - **`record_budget` + `EvictionPolicy` are named after katgpt-rs's
   `LatentContextBuffer` (`mux_latent/buffer.rs`), but are a from-scratch
   design, not a port** — a closer look at the real source turned up two
