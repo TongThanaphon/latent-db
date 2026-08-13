@@ -141,3 +141,38 @@ slower than at 10,000 calls (this bench's `assert_monotonic` harness
 self-check, in place of `support::self_check_regression_gate_fires()` --
 see this file's header note above for why `storage_bench.rs` doesn't import
 `benches/support/mod.rs` directly).
+
+## Issues #22-#24 (`latent-db-embedded` topology + steering + zero-alloc query loop)
+
+Same host as above (Apple M2). #22 (`topology::{ViableNode, is_viable}`) and
+#23 (`steering::{steer_next, EdgeWeights}`) are unit-tested only, no bench of
+their own -- #24 is the one with a runtime-sensitive acceptance criterion
+(see below).
+
+**Run:** `cargo bench -p latent-db-embedded --bench query_loop_bench`
+
+### `query_loop_bench` (dim=768, 10,000 calls, release profile)
+
+Reports **per-iteration** latency directly (`total / calls`), not a raw
+batch total like `storage_bench` above -- #24's acceptance criteria asks
+specifically for per-iteration latency.
+
+| scenario | measured | budget |
+|---|---|---|
+| `query_step` (per-iter) | ~0.63-0.64 us | 3.0 us |
+
+Also asserts 2,500 calls never measure slower than 10,000 (same
+`assert_monotonic` self-check as `storage_bench`).
+
+### `tests/query_loop_alloc_check.rs`: 1,000,000-iteration debug-mode run
+
+This is `cargo test`'s (unoptimized, `-O0`) cost, not `cargo bench`'s
+(optimized) -- the two numbers above and below aren't comparable to each
+other. Measured **~7.2s** for the full 1,000,000-iteration loop under plain
+`cargo test`, asserting `get_alloc_stats()` reports `(0, 0)` allocations
+across the whole run. That runtime is a deliberate acceptance-criteria
+tradeoff (#24 asks for exactly 1,000,000 iterations, gated the same way as
+this repo's other `*_alloc_check` tests -- i.e. debug-mode, not
+release-only), not an oversight; see the test file's own header comment for
+the full reasoning, including the `steer_next` loop-unrolling change (~2x
+runtime cut) this sizing spike motivated.

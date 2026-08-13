@@ -21,3 +21,8 @@ latent-db = { path = ".." }
 name = "storage_bench"
 path = "benches/storage_bench.rs"
 harness = false
+
+[[bench]]
+name = "query_loop_bench"
+path = "benches/query_loop_bench.rs"
+harness = false
