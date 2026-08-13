@@ -1,3 +1,14 @@
+# latent-db-embedded (Issue #20) is a sibling no_std, zero-dependency crate
+# for fixed-DIM embedded targets -- coexisting with, not replacing, this
+# dynamic-dimension std crate. See docs/adr/0001-latent-db-embedded-coexistence.md.
+# default-members: pre-commit's unqualified `cargo test`/`cargo clippy
+# --all-targets` must reach both crates, not just the root package a bare
+# manifest-with-[workspace] would default to.
+[workspace]
+members = ["latent-db-embedded"]
+default-members = [".", "latent-db-embedded"]
+resolver = "2"
+
 [package]
 name = "latent-db"
 version = "0.1.0"

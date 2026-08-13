@@ -1,0 +1,10 @@
+[package]
+name = "latent-db-embedded"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Zero entries by design (Issue #20 acceptance criteria) -- the whole point
+# of this crate is a build with nothing to vendor or vet for a bare-metal
+# target.
+[dependencies]
