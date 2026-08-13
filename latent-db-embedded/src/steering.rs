@@ -49,6 +49,38 @@ impl EdgeWeights {
     }
 }
 
+/// `state[i] += alpha * direction[i]` for every `i`, 8-way loop-unrolled
+/// like `storage::dot_product` -- same rationale, plus a debug-mode-specific
+/// one: issue #24's 1,000,000-iteration test calls [`steer_next`] once per
+/// iteration and runs under `#![cfg(debug_assertions)]` (no LLVM
+/// optimization), where a `state.iter_mut().zip(direction.iter())` version
+/// of this loop measured ~2.4x slower per call than this unrolled one --
+/// unoptimized builds don't inline `Iterator::next()` across the `Zip`
+/// adapter, so each element pays its loop-bookkeeping cost individually
+/// instead of it being amortized across 8 elements per iteration.
+#[inline(always)]
+fn add_scaled(state: &mut [f32; DIM], direction: &[f32; DIM], alpha: f32) {
+    let chunks = DIM / 8;
+    let mut i = 0;
+    for _ in 0..chunks {
+        state[i] += alpha * direction[i];
+        state[i + 1] += alpha * direction[i + 1];
+        state[i + 2] += alpha * direction[i + 2];
+        state[i + 3] += alpha * direction[i + 3];
+        state[i + 4] += alpha * direction[i + 4];
+        state[i + 5] += alpha * direction[i + 5];
+        state[i + 6] += alpha * direction[i + 6];
+        state[i + 7] += alpha * direction[i + 7];
+        i += 8;
+    }
+    // Dead when `DIM % 8 == 0` (true for `DIM = 768` today), kept so this
+    // stays correct if `DIM` ever changes -- mirrors `dot_product`'s tail.
+    while i < DIM {
+        state[i] += alpha * direction[i];
+        i += 1;
+    }
+}
+
 /// Advances `state` in place by `alpha * direction`, provided the resulting
 /// position is still [`is_viable`] within `boundary`.
 ///
@@ -66,15 +98,11 @@ pub fn steer_next(
     alpha: f32,
     boundary: &Boundary,
 ) -> bool {
-    for (s, d) in state.iter_mut().zip(direction.iter()) {
-        *s += alpha * d;
-    }
+    add_scaled(state, direction, alpha);
     if is_viable(state, boundary) {
         true
     } else {
-        for (s, d) in state.iter_mut().zip(direction.iter()) {
-            *s -= alpha * d;
-        }
+        add_scaled(state, direction, -alpha);
         false
     }
 }
