@@ -50,6 +50,25 @@ fn query_step(
     steer_next(state, direction, alpha, boundary)
 }
 
+/// Same periodic-probe alpha schedule as `tests/query_loop_alloc_check.rs`
+/// (see its own doc comment for why): mostly a small in-bounds step, with an
+/// occasional deliberately oversized one that `steer_next` must reject --
+/// so the measured per-iteration cost below reflects both of `steer_next`'s
+/// branches, not just its always-succeeds path.
+const PROBE_PERIOD: usize = 1_000;
+const NORMAL_ALPHA: f32 = 0.001;
+const PROBE_ALPHA: f32 = 50.0;
+
+fn alpha_for(i: usize) -> f32 {
+    if i % PROBE_PERIOD == PROBE_PERIOD - 1 {
+        PROBE_ALPHA
+    } else if i.is_multiple_of(2) {
+        NORMAL_ALPHA
+    } else {
+        -NORMAL_ALPHA
+    }
+}
+
 /// Best-of-`iters` wall-clock microseconds for a closure, after `warmup`
 /// untimed calls. Mirrors `benches/support/mod.rs::bench_us` at the repo
 /// root.
@@ -150,14 +169,13 @@ fn bench_query_steps(calls: usize) -> f64 {
 
     bench_us(2, 10, || {
         for i in 0..calls {
-            let alpha = if i % 2 == 0 { 0.001 } else { -0.001 };
             let committed = query_step(
                 std::hint::black_box(&mut state),
                 std::hint::black_box(&node),
                 std::hint::black_box(&latents),
                 std::hint::black_box(&mut weights),
                 std::hint::black_box(&direction),
-                alpha,
+                alpha_for(i),
                 std::hint::black_box(&boundary),
             );
             std::hint::black_box(committed);

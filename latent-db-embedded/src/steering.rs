@@ -36,6 +36,15 @@ impl EdgeWeights {
 
     /// The current weight at `edge_index` (the position in
     /// `ViableNode::neighbors` the weight applies to).
+    ///
+    /// # Panics
+    /// Panics if `edge_index >= MAX_NEIGHBORS`, same as indexing `neighbors`
+    /// directly would. Unlike `ViableNode::push_neighbor` (which returns
+    /// `false` on overflow because running out of edge slots is an
+    /// ordinary, expected outcome of building a node), an out-of-range
+    /// `edge_index` here means the caller passed an index it didn't get
+    /// from that node's own `live_neighbors()` -- a caller bug, not a
+    /// runtime state to handle gracefully.
     pub fn get(&self, edge_index: usize) -> f32 {
         self.weights[edge_index]
     }
@@ -43,6 +52,9 @@ impl EdgeWeights {
     /// O(1) read-modify-write of the weight at `edge_index`: a single
     /// indexed add, no scan over `neighbors` to locate the edge -- the
     /// caller supplies the index directly. Returns the updated weight.
+    ///
+    /// # Panics
+    /// Same as [`Self::get`]: `edge_index >= MAX_NEIGHBORS` panics.
     pub fn update(&mut self, edge_index: usize, delta: f32) -> f32 {
         self.weights[edge_index] += delta;
         self.weights[edge_index]
@@ -84,9 +96,11 @@ fn add_scaled(state: &mut [f32; DIM], direction: &[f32; DIM], alpha: f32) {
 /// Advances `state` in place by `alpha * direction`, provided the resulting
 /// position is still [`is_viable`] within `boundary`.
 ///
-/// If the candidate step would leave the safe region, `state` is reverted to
-/// its original value and this returns `false`. Otherwise `state` holds the
-/// new position and this returns `true`.
+/// If the candidate step would leave the safe region, `state` is reverted
+/// back to (within IEEE 754 floating-point rounding of) its original value
+/// and this returns `false` -- `(a + x) - x` isn't guaranteed bit-exact, so
+/// don't rely on an exact round-trip across a rejected step. Otherwise
+/// `state` holds the new position and this returns `true`.
 ///
 /// No second `[f32; DIM]` buffer is allocated to hold the candidate before
 /// checking it: `state` is mutated in place, speculatively, then reverted in

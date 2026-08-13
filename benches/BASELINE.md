@@ -155,7 +155,11 @@ their own -- #24 is the one with a runtime-sensitive acceptance criterion
 
 Reports **per-iteration** latency directly (`total / calls`), not a raw
 batch total like `storage_bench` above -- #24's acceptance criteria asks
-specifically for per-iteration latency.
+specifically for per-iteration latency. Each call uses a periodic-probe
+alpha schedule (a small in-bounds step every iteration, plus a deliberately
+oversized one every 1,000th) so the measured cost reflects both of
+`steer_next`'s branches (commit and boundary-reject/revert), not just its
+always-succeeds path.
 
 | scenario | measured | budget |
 |---|---|---|
@@ -170,7 +174,11 @@ This is `cargo test`'s (unoptimized, `-O0`) cost, not `cargo bench`'s
 (optimized) -- the two numbers above and below aren't comparable to each
 other. Measured **~7.2s** for the full 1,000,000-iteration loop under plain
 `cargo test`, asserting `get_alloc_stats()` reports `(0, 0)` allocations
-across the whole run. That runtime is a deliberate acceptance-criteria
+across the whole run -- exactly 999,000 committed and 1,000 rejected steps
+per the same probe schedule (verified by an exact-count assertion in the
+test itself), and a separate positive-control test proving the tracking
+allocator is actually reachable from this crate's test binary before that
+`(0, 0)` is trusted. That runtime is a deliberate acceptance-criteria
 tradeoff (#24 asks for exactly 1,000,000 iterations, gated the same way as
 this repo's other `*_alloc_check` tests -- i.e. debug-mode, not
 release-only), not an oversight; see the test file's own header comment for

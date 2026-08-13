@@ -15,11 +15,24 @@ use crate::{DIM, MAX_NEIGHBORS};
 /// [`crate::storage::ZeroAllocLatent`]'s deliberate `!Copy` at
 /// `VECTOR_BYTES + 8` (3080) bytes.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub struct ViableNode {
     pub vector_idx: u32,
     pub neighbors: [u32; MAX_NEIGHBORS],
     pub neighbor_count: u8,
+}
+
+// Hand-rolled rather than `#[derive(PartialEq)]`: a derived impl would
+// compare the full `neighbors` array, including the unset trailing slots
+// past `neighbor_count` -- which can hold anything (see
+// `live_neighbors_never_reads_past_neighbor_count`'s test, which pokes a
+// sentinel there on purpose). Two nodes with the same live edges but
+// different leftover bytes in those dead slots are the same node and must
+// compare equal.
+impl PartialEq for ViableNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.vector_idx == other.vector_idx && self.live_neighbors() == other.live_neighbors()
+    }
 }
 
 impl ViableNode {
@@ -68,6 +81,17 @@ pub struct Boundary {
 
 /// Whether every coordinate of `v` falls within `boundary`, inclusive on
 /// both ends. Allocates nothing; short-circuits on the first violation.
+///
+/// Deliberately left as this `Iterator::all` form rather than given the
+/// 8-way manual unroll `storage::dot_product`/`steering::add_scaled` use for
+/// their O(DIM) hot loops: measured under `-O0` (the profile issue #24's
+/// 1,000,000-iteration test actually runs in), this form was *faster* than
+/// an indexed loop, not slower -- the opposite of `steer_next`'s commit loop.
+/// A hand-indexed rewrite here would touch each `v[i]` twice per element (a
+/// `<` and a `>` bounds-checked read apiece) unless written carefully to
+/// bind `v[i]` to a local first, and even the careful version measured
+/// worse than this one in that spike. Don't unroll this on the assumption
+/// that it must help; re-measure first.
 pub fn is_viable(v: &[f32; DIM], boundary: &Boundary) -> bool {
     v.iter().all(|&x| x >= boundary.min && x <= boundary.max)
 }
@@ -137,6 +161,32 @@ mod tests {
         // would fail the assertion below if `live_neighbors()` leaked it.
         node.neighbors[1] = 0xDEAD_BEEF;
         assert_eq!(node.live_neighbors(), &[42]);
+    }
+
+    #[test]
+    fn equality_ignores_garbage_in_unset_trailing_slots() {
+        let mut a = ViableNode::new(1);
+        a.push_neighbor(42);
+        let mut b = a;
+        // Same live edges, different leftover bytes in the dead slots past
+        // `neighbor_count` -- a derived `PartialEq` would see these as
+        // unequal since it compares the full backing array.
+        b.neighbors[1] = 0xDEAD_BEEF;
+        b.neighbors[2] = 0xBAD_C0DE;
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn equality_still_distinguishes_real_differences() {
+        let mut a = ViableNode::new(1);
+        a.push_neighbor(42);
+        let mut b = a;
+        b.vector_idx = 2;
+        assert_ne!(a, b);
+
+        let mut c = a;
+        c.push_neighbor(43);
+        assert_ne!(a, c);
     }
 
     // ── is_viable ───────────────────────────────────────────────────────
