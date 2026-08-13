@@ -19,5 +19,6 @@ pub const DIM: usize = 768;
 /// Upper bound on outgoing edges a single graph node may hold.
 pub const MAX_NEIGHBORS: usize = 16;
 
+pub mod steering;
 pub mod storage;
 pub mod topology;
