@@ -20,3 +20,4 @@ pub const DIM: usize = 768;
 pub const MAX_NEIGHBORS: usize = 16;
 
 pub mod storage;
+pub mod topology;
