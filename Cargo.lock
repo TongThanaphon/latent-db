@@ -1923,6 +1923,9 @@ dependencies = [
 [[package]]
 name = "latent-db-embedded"
 version = "0.1.0"
+dependencies = [
+ "latent-db",
+]
 
 [[package]]
 name = "lazy_static"

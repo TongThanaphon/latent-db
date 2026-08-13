@@ -8,3 +8,16 @@ publish = false
 # of this crate is a build with nothing to vendor or vet for a bare-metal
 # target.
 [dependencies]
+
+# Only linked into `cargo test`/`cargo bench` binaries, never the `no_std`
+# build artifact (see ADR-0001 decision 1 and lib.rs's
+# `cfg_attr(not(test), no_std)`) -- lets this crate's unit tests
+# cross-check `storage::dot_product`/`cosine_similarity` against
+# `latent_db::simd::simd_dot_f32`/`cosine_sim` (Issue #21).
+[dev-dependencies]
+latent-db = { path = ".." }
+
+[[bench]]
+name = "storage_bench"
+path = "benches/storage_bench.rs"
+harness = false

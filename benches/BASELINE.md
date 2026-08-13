@@ -116,3 +116,28 @@ measured range above being well under half of that scalar figure. This
 confirms the kernel itself is genuinely multi-x faster; `build_viable_graph`'s
 diluted ~8% end-to-end number reflects the surrounding O(n log n) sort cost,
 not a weak kernel.
+
+## Issue #21 (`latent-db-embedded` storage: `ZeroAllocLatent` + unrolled dot/cosine)
+
+Same host as above (Apple M2, NEON `hw_sqrt_aarch64` path). New crate,
+new bench (`latent-db-embedded/benches/storage_bench.rs`): plain 8-way
+loop-unrolled scalar Rust (no `core::arch` SIMD intrinsics -- `DIM = 768` is
+a compile-time constant LLVM auto-vectorizes on its own), so these numbers
+aren't directly comparable to `latent_db::simd`'s hand-dispatched AVX2/NEON
+kernels above -- they're a baseline for *this* crate's own future
+optimization tickets to measure against.
+
+**Run:** `cargo bench -p latent-db-embedded --bench storage_bench`
+
+### `storage_bench` (dim=768, 10,000 calls per measured scenario)
+
+| scenario | measured | budget |
+|---|---|---|
+| `dot_product` | ~0.66-1.4 ms | 6.0 ms |
+| `cosine_similarity` | ~1.8-2.2 ms | 10.0 ms |
+
+Also asserts `dot_product`/`cosine_similarity` at 2,500 calls never measure
+slower than at 10,000 calls (this bench's `assert_monotonic` harness
+self-check, in place of `support::self_check_regression_gate_fires()` --
+see this file's header note above for why `storage_bench.rs` doesn't import
+`benches/support/mod.rs` directly).
