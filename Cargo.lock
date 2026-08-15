@@ -1921,6 +1921,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "latent-db-embedded"
+version = "0.1.0"
+dependencies = [
+ "latent-db",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
